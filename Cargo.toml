@@ -1,0 +1,9 @@
+[package]
+name = "rnix-jit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rnix = "0.11"
+nix = "0.29"
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["intel", "decoder", "code_asm", "std"] }
