@@ -125,11 +125,15 @@ fn build_program(expr: Expr, program: &mut Program) {
         },
         Expr::Lambda(x) => {
             let param = x.param().unwrap();
+            let param = match param {
+                rnix::ast::Param::Pattern(_) => todo!("ident param"),
+                rnix::ast::Param::IdentParam(ident) => ident.to_string(),
+            };
             let body = x.body().unwrap();
             let mut function_executable = Program::new();
             build_program(body, &mut function_executable);
             let compiled = function_executable
-                .compile(Some(param.to_string()))
+                .compile(Some(param))
                 .unwrap();
             program.operations.push(Operation::PushFunction(compiled))
         }
