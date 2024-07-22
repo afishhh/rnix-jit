@@ -9,6 +9,7 @@ let twenty = 20; in {
 	aa = let inherit twenty; in twenty;
 	functionsAreSupported = (hello: hello + 30) 50;
 	functionPatternParam = ({ hello ? 4, next ? 2 }: hello + next) { hello = 60; };
+	setAttrpath = { h.l = 1; }.h.l;
 	hasAttr = [
 		({ h = 1; }?h)
 		({ l = 1; }?h)

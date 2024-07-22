@@ -17,7 +17,7 @@ use std::{
 
 use iced_x86::{code_asm::*, Formatter};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
-use rnix::ast::{Attr, Expr, HasEntry, InterpolPart};
+use rnix::ast::{Attr, Attrpath, Expr, HasEntry, InterpolPart};
 
 #[derive(Debug)]
 enum Operation {
@@ -26,7 +26,7 @@ enum Operation {
     PushFunction(Executable),
     CreateAttrset,
     InheritAttrs(bool, Vec<String>),
-    SetAttr(Program),
+    SetAttrpath(usize, Program),
     GetAttrConsume,
     HasAttrpath(usize),
     PushList,
@@ -75,6 +75,22 @@ fn attr_assert_const(attr: Attr) -> String {
         Attr::Dynamic(_) => todo!(),
         Attr::Str(_) => todo!(),
     }
+}
+
+fn build_attrpath(here: &Path, attrpath: Attrpath, program: &mut Program) -> usize {
+    let mut n = 0;
+    for attr in attrpath.attrs().collect::<Vec<_>>().into_iter().rev() {
+        match attr {
+            Attr::Ident(x) => program.operations.push(Operation::Push(
+                UnpackedValue::new_string(x.ident_token().unwrap().green().text().to_string())
+                    .pack(),
+            )),
+            Attr::Dynamic(x) => build_program(here, x.expr().unwrap(), program),
+            Attr::Str(_) => todo!(),
+        };
+        n += 1;
+    }
+    n
 }
 
 fn build_program(here: &Path, expr: Expr, program: &mut Program) {
@@ -237,15 +253,9 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
             }
             for keyvalue in x.attrpath_values() {
                 let path = keyvalue.attrpath().unwrap();
-                let value = keyvalue.value().unwrap();
-                let value_program = create_program(here, value);
-                let mut attrs = path.attrs();
-                let name = attr_assert_const(attrs.next().unwrap());
-                assert!(attrs.next().is_none());
-                program
-                    .operations
-                    .push(Operation::Push(UnpackedValue::new_string(name).pack()));
-                program.operations.push(Operation::SetAttr(value_program));
+                let value = create_program(here, keyvalue.value().unwrap());
+                let n = build_attrpath(here, path, program);
+                program.operations.push(Operation::SetAttrpath(n, value));
             }
         }
         Expr::UnaryOp(x) => {
@@ -371,6 +381,14 @@ impl LazyMap {
         self.values
             .get_mut(key)
             .map(|value| value.evaluate().clone())
+    }
+
+    fn get_lazy_or_insert_with(
+        &mut self,
+        key: String,
+        inserter: impl FnOnce() -> LazyValue,
+    ) -> &LazyValue {
+        self.values.entry(key).or_insert_with(inserter)
     }
 
     fn get_lazy(&self, key: &str) -> Option<&LazyValue> {
@@ -610,6 +628,17 @@ unsafe extern "C" fn attrset_get(map: &mut LazyMap, name: Value) -> Value {
         panic!("GetAttr called with non-string name")
     };
     map.get(unsafe { (*name).as_str() }).unwrap()
+}
+
+unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut LazyMap, name: Value) -> Value {
+    let UnpackedValue::String(name) = name.unpack() else {
+        panic!("GetAttr called with non-string name")
+    };
+    map.get_lazy_or_insert_with(unsafe { (*name).to_string() }, || {
+        UnpackedValue::new_attrset(LazyMap::new()).into()
+    })
+    .evaluate()
+    .clone()
 }
 
 unsafe extern "C" fn attrset_hasattr(map: &mut LazyMap, name: Value) -> Value {
@@ -898,16 +927,34 @@ impl Program {
                         asm.push(rax)?;
                         stack_values += 1;
                     }
-                    Operation::SetAttr(value_program) => {
+                    Operation::SetAttrpath(components, value_program) => {
                         // FIXME: leak
                         let raw = Rc::into_raw(Rc::new(value_program.compile(None)?));
 
-                        assert!(stack_values >= 2);
-                        asm.pop(rcx)?;
-                        asm.mov(rdi, qword_ptr(rsp))?;
-                        stack_values -= 1;
+                        assert!(stack_values > components);
+                        asm.mov(rdi, qword_ptr(rsp + (8 * components)))?;
 
                         let mut not_an_attrset = asm.create_label();
+                        for _ in 0..(components - 1) {
+                            asm.mov(rbx, rdi)?;
+                            asm.and(rbx, VALUE_TAG_MASK as i32)?;
+                            asm.cmp(bl, ValueKind::Attrset as u32)?;
+                            asm.jne(not_an_attrset)?;
+                            asm.cmp(rdi, 0)?; // attrset tag also applies to null
+                            asm.je(not_an_attrset)?;
+
+                            asm.add(
+                                rdi,
+                                offset_of!(HeapValue<LazyMap>, value) as i32
+                                    - ValueKind::Attrset as i32,
+                            )?;
+
+                            asm.pop(rsi)?;
+                            stack_values -= 1;
+                            call!(rust attrset_get_or_insert_attrset);
+                            asm.mov(rdi, rax)?;
+                        }
+
                         asm.mov(rbx, rdi)?;
                         asm.and(rbx, VALUE_TAG_MASK as i32)?;
                         asm.cmp(bl, ValueKind::Attrset as u32)?;
@@ -922,6 +969,8 @@ impl Program {
                         )?;
                         asm.mov(rsi, r15)?;
                         asm.mov(rdx, raw as u64)?;
+                        asm.pop(rcx)?;
+                        stack_values -= 1;
 
                         call!(rust attrset_set);
 
@@ -1166,11 +1215,7 @@ impl Program {
                         let names = Vec::leak(names);
                         let has_from = if let Some(program) = from {
                             // FIXME: leak
-                            asm.mov(
-                                rsi,
-                                Rc::into_raw(Rc::new(program.compile(None)?)) as *const Executable
-                                    as u64,
-                            )?;
+                            asm.mov(rsi, Rc::into_raw(Rc::new(program.compile(None)?)) as u64)?;
                             true
                         } else {
                             asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, previous)))?;
