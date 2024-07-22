@@ -2,11 +2,11 @@
 #![allow(clippy::fn_to_numeric_cast)]
 #![allow(clippy::type_complexity)]
 
-use core::arch::asm;
+use core::{arch::asm, panic};
 use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
-    ffi::CStr,
+    ffi::{CStr, CString},
     fmt::{Debug, Display, Write},
     mem::{offset_of, MaybeUninit},
     ops::{Deref, DerefMut},
@@ -17,7 +17,7 @@ use std::{
 
 use iced_x86::{code_asm::*, Formatter};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
-use rnix::ast::{Expr, HasEntry, InterpolPart};
+use rnix::ast::{Attr, Expr, HasEntry, InterpolPart};
 
 #[derive(Debug)]
 enum Operation {
@@ -28,8 +28,11 @@ enum Operation {
     InheritAttrs(bool, Vec<String>),
     SetAttr(Program),
     GetAttrConsume,
+    HasAttrpath(usize),
     PushList,
     ListAppend(Program),
+    Concat,
+    Update,
     Add,
     Sub,
     Mul,
@@ -45,12 +48,14 @@ enum Operation {
     Implication,
     Apply,
     ScopePush,
-    ScopeInherit(bool, Vec<String>),
+    ScopeInherit(Option<Program>, Vec<String>),
     ScopeSet(String, Program),
     // identifier lookup
     Load(String),
     ScopePop,
     IfElse(Program, Program),
+    Invert,
+    Negate,
 }
 
 #[derive(Debug)]
@@ -58,31 +63,40 @@ struct Program {
     operations: Vec<Operation>,
 }
 
-fn create_program(expr: Expr) -> Program {
+fn create_program(here: &Path, expr: Expr) -> Program {
     let mut program = Program::new();
-    build_program(expr, &mut program);
+    build_program(here, expr, &mut program);
     program
 }
 
-fn build_program(expr: Expr, program: &mut Program) {
+fn attr_assert_const(attr: Attr) -> String {
+    match attr {
+        Attr::Ident(x) => x.ident_token().unwrap().green().text().to_string(),
+        Attr::Dynamic(_) => todo!(),
+        Attr::Str(_) => todo!(),
+    }
+}
+
+fn build_program(here: &Path, expr: Expr, program: &mut Program) {
     match expr {
         Expr::Apply(x) => {
-            build_program(x.argument().unwrap(), program);
-            build_program(x.lambda().unwrap(), program);
+            build_program(here, x.argument().unwrap(), program);
+            build_program(here, x.lambda().unwrap(), program);
             program.operations.push(Operation::Apply);
         }
-        Expr::Assert(_) => todo!(),
+        // TODO:
+        Expr::Assert(_) => (),
         Expr::Error(_) => todo!(),
         Expr::IfElse(x) => {
-            build_program(x.condition().unwrap(), program);
-            let if_true = create_program(x.body().unwrap());
-            let if_false = create_program(x.else_body().unwrap());
+            build_program(here, x.condition().unwrap(), program);
+            let if_true = create_program(here, x.body().unwrap());
+            let if_false = create_program(here, x.else_body().unwrap());
             program
                 .operations
                 .push(Operation::IfElse(if_true, if_false))
         }
         Expr::Select(x) => {
-            build_program(x.expr().unwrap(), program);
+            build_program(here, x.expr().unwrap(), program);
             for attr in x.attrpath().unwrap().attrs() {
                 program.operations.push(Operation::Push(
                     UnpackedValue::new_string(attr.to_string()).pack(),
@@ -106,7 +120,7 @@ fn build_program(expr: Expr, program: &mut Program) {
             let mut parts = x.parts().collect::<Vec<_>>();
             match &mut parts[..] {
                 [InterpolPart::Literal(value)] => program.operations.push(Operation::Push(
-                    UnpackedValue::new_path(PathBuf::from(value.to_string())).pack(),
+                    UnpackedValue::new_path(here.join(value.to_string())).pack(),
                 )),
                 [] => program.operations.push(Operation::Push(
                     UnpackedValue::new_path(PathBuf::new()).pack(),
@@ -126,59 +140,71 @@ fn build_program(expr: Expr, program: &mut Program) {
         Expr::Lambda(x) => {
             let param = x.param().unwrap();
             let param = match param {
-                rnix::ast::Param::Pattern(_) => todo!("ident param"),
-                rnix::ast::Param::IdentParam(ident) => ident.to_string(),
+                rnix::ast::Param::Pattern(pat) => Parameter::Pattern {
+                    entries: pat
+                        .pat_entries()
+                        .map(|x| {
+                            (
+                                x.ident().unwrap().to_string(),
+                                x.default()
+                                    .map(|x| create_program(here, x))
+                                    .map(|x| x.compile(None).unwrap()),
+                            )
+                        })
+                        .collect(),
+                    binding: pat.pat_bind().map(|x| x.ident().unwrap().to_string()),
+                    ignore_unmatched: pat.ellipsis_token().is_some(),
+                },
+                rnix::ast::Param::IdentParam(ident) => {
+                    Parameter::Ident(ident.ident().unwrap().to_string())
+                }
             };
             let body = x.body().unwrap();
             let mut function_executable = Program::new();
-            build_program(body, &mut function_executable);
-            let compiled = function_executable
-                .compile(Some(param))
-                .unwrap();
+            build_program(here, body, &mut function_executable);
+            let compiled = function_executable.compile(Some(param)).unwrap();
             program.operations.push(Operation::PushFunction(compiled))
         }
         Expr::LegacyLet(_) => todo!(),
         Expr::LetIn(x) => {
             program.operations.push(Operation::ScopePush);
             for inherit in x.inherits() {
-                let has_source = if let Some(source) = inherit.from().and_then(|f| f.expr()) {
-                    build_program(source, program);
-                    true
-                } else {
-                    false
-                };
+                let source = inherit
+                    .from()
+                    .and_then(|f| f.expr())
+                    .map(|source| create_program(here, source));
                 program.operations.push(Operation::ScopeInherit(
-                    has_source,
-                    inherit.attrs().map(|x| x.to_string()).collect(),
+                    source,
+                    inherit.attrs().map(attr_assert_const).collect(),
                 ));
             }
             for entry in x.attrpath_values() {
                 let mut it = entry.attrpath().unwrap().attrs();
-                let name = it.next().unwrap();
+                let name = attr_assert_const(it.next().unwrap());
                 let value = entry.value().unwrap();
-                let value_program = create_program(value);
+                let value_program = create_program(here, value);
                 program
                     .operations
-                    .push(Operation::ScopeSet(name.to_string(), value_program));
+                    .push(Operation::ScopeSet(name, value_program));
             }
-            build_program(x.body().unwrap(), program);
+            build_program(here, x.body().unwrap(), program);
             program.operations.push(Operation::ScopePop);
         }
         Expr::List(x) => {
             program.operations.push(Operation::PushList);
             for item in x.items() {
-                let value_program = create_program(item);
+                let value_program = create_program(here, item);
                 program
                     .operations
                     .push(Operation::ListAppend(value_program));
             }
         }
         Expr::BinOp(x) => {
-            build_program(x.lhs().unwrap(), program);
-            build_program(x.rhs().unwrap(), program);
+            build_program(here, x.lhs().unwrap(), program);
+            build_program(here, x.rhs().unwrap(), program);
             program.operations.push(match x.operator().unwrap() {
-                rnix::ast::BinOpKind::Concat => todo!(),
-                rnix::ast::BinOpKind::Update => todo!(),
+                rnix::ast::BinOpKind::Concat => Operation::Concat,
+                rnix::ast::BinOpKind::Update => Operation::Update,
                 rnix::ast::BinOpKind::Add => Operation::Add,
                 rnix::ast::BinOpKind::Sub => Operation::Sub,
                 rnix::ast::BinOpKind::Mul => Operation::Mul,
@@ -194,27 +220,27 @@ fn build_program(expr: Expr, program: &mut Program) {
                 rnix::ast::BinOpKind::Or => Operation::Or,
             })
         }
-        Expr::Paren(x) => build_program(x.expr().unwrap(), program),
+        Expr::Paren(x) => build_program(here, x.expr().unwrap(), program),
         Expr::AttrSet(x) => {
             program.operations.push(Operation::CreateAttrset);
             for inherit in x.inherits() {
                 let has_source = if let Some(source) = inherit.from().and_then(|f| f.expr()) {
-                    build_program(source, program);
+                    build_program(here, source, program);
                     true
                 } else {
                     false
                 };
                 program.operations.push(Operation::InheritAttrs(
                     has_source,
-                    inherit.attrs().map(|x| x.to_string()).collect(),
+                    inherit.attrs().map(attr_assert_const).collect(),
                 ));
             }
             for keyvalue in x.attrpath_values() {
                 let path = keyvalue.attrpath().unwrap();
                 let value = keyvalue.value().unwrap();
-                let value_program = create_program(value);
+                let value_program = create_program(here, value);
                 let mut attrs = path.attrs();
-                let name = attrs.next().unwrap().to_string();
+                let name = attr_assert_const(attrs.next().unwrap());
                 assert!(attrs.next().is_none());
                 program
                     .operations
@@ -222,23 +248,41 @@ fn build_program(expr: Expr, program: &mut Program) {
                 program.operations.push(Operation::SetAttr(value_program));
             }
         }
-        Expr::UnaryOp(_) => todo!(),
+        Expr::UnaryOp(x) => {
+            build_program(here, x.expr().unwrap(), program);
+            program.operations.push(match x.operator().unwrap() {
+                rnix::ast::UnaryOpKind::Invert => Operation::Invert,
+                rnix::ast::UnaryOpKind::Negate => Operation::Negate,
+            })
+        }
         Expr::Ident(x) => program.operations.push(Operation::Load(
             x.ident_token().unwrap().green().text().to_string(),
         )),
         Expr::With(_) => todo!(),
-        Expr::HasAttr(_) => todo!(),
+        Expr::HasAttr(x) => {
+            build_program(here, x.expr().unwrap(), program);
+            let mut parts = 0;
+            for attr in x.attrpath().unwrap().attrs() {
+                let name = attr_assert_const(attr);
+                program
+                    .operations
+                    .push(Operation::Push(UnpackedValue::new_string(name).pack()));
+                parts += 1;
+            }
+            program.operations.push(Operation::HasAttrpath(parts))
+        }
         _ => todo!(),
     }
 }
 
+#[derive(Debug)]
 enum LazyValueImpl {
     Evaluated(Value),
     LazyJIT((*mut Scope, Rc<Executable>)),
     LazyBuiltin(MaybeUninit<Box<dyn FnOnce() -> Value>>),
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct LazyValue(Rc<UnsafeCell<LazyValueImpl>>);
 
 impl LazyValue {
@@ -329,6 +373,10 @@ impl LazyMap {
             .map(|value| value.evaluate().clone())
     }
 
+    fn get_lazy(&self, key: &str) -> Option<&LazyValue> {
+        self.values.get(key)
+    }
+
     fn set(&mut self, key: String, value: impl Into<LazyValue>) {
         self.values.insert(key, value.into());
     }
@@ -336,14 +384,6 @@ impl LazyMap {
     fn iter(&self) -> impl Iterator<Item = (&str, &LazyValue)> {
         self.values.iter().map(|x| (x.0.as_str(), x.1))
     }
-}
-
-// TODO: Scope could be made more "dynamically interoperable" with Attrset by making both be HeapValues just with Scope having an extra previous field
-//       then both a scope and an attrset could be modified by just pointering through to their LazyMaps via an assembly qword_ptr deref
-#[repr(C)]
-struct Scope {
-    values: LazyMap,
-    previous: *mut Scope,
 }
 
 #[derive(Debug)]
@@ -356,10 +396,9 @@ impl Executable {
     #[inline(always)]
     fn run(&self, scope: *mut Scope, arg: &Value) -> Value {
         unsafe {
-            asm!("mov r15, {}", in(reg) scope);
+            asm!("mov r15, {}", in(reg) scope, out("r15") _);
+            (self.code)(Value::NULL, arg.leaking_copy())
         }
-
-        (self.code)(Value::NULL, arg.leaking_copy())
     }
 }
 
@@ -373,41 +412,92 @@ impl Drop for Executable {
     }
 }
 
-unsafe extern "C" fn scope_lookup(
-    mut scope: *mut Scope,
-    name: *const u8,
-    name_len: usize,
-) -> Value {
-    let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, name_len));
-    loop {
-        match (*scope).values.get(name) {
-            Some(value) => return value,
-            None => {
-                scope = (*scope).previous;
-                if scope.is_null() {
-                    panic!("identifier {name} not found")
+#[repr(C)]
+struct Scope {
+    values: LazyMap,
+    previous: *mut Scope,
+}
+
+impl Scope {
+    unsafe fn lookup_lazy(mut scope: *mut Scope, name: &str) -> LazyValue {
+        loop {
+            match dbg!((*dbg!(scope)).values.get_lazy(dbg!(name))) {
+                Some(value) => return value.clone(),
+                None => {
+                    scope = (*scope).previous;
+                    if scope.is_null() {
+                        panic!("identifier {name} not found")
+                    }
                 }
             }
         }
     }
+
+    unsafe fn lookup(scope: *mut Scope, name: &str) -> Value {
+        Scope::lookup_lazy(scope, name).evaluate().clone()
+    }
+}
+
+unsafe extern "C" fn scope_lookup(scope: *mut Scope, name: *const u8, name_len: usize) -> Value {
+    let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, name_len));
+    Scope::lookup(scope, name)
 }
 
 unsafe extern "C" fn scope_function_scope(
     previous: *mut Scope,
-    name: *const u8,
-    name_len: usize,
     value: Value,
+    parameter: *const Parameter,
 ) -> *mut Scope {
-    let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, name_len));
-    println!("creating function scope {previous:?} {name} {name_len} {value:?}");
-    Box::leak(Box::new(Scope {
-        values: {
-            let mut map = LazyMap::new();
-            map.set(name.to_string(), LazyValue::from_value(value));
-            map
-        },
-        previous,
-    }))
+    match &*parameter {
+        Parameter::Ident(name) => {
+            println!("creating function scope {previous:?} {name} {value:?}");
+            Box::leak(Box::new(Scope {
+                values: {
+                    let mut map = LazyMap::new();
+                    map.set(name.to_string(), LazyValue::from_value(value));
+                    map
+                },
+                previous,
+            }))
+        }
+        Parameter::Pattern {
+            entries,
+            binding,
+            ignore_unmatched,
+        } => {
+            let UnpackedValue::Attrset(heapvalue) = value.unpack() else {
+                panic!("cannot unpack non-attrset value in pattern parameter");
+            };
+            let mut scope = LazyMap::new();
+            let mut found_keys = 0;
+            for (key, default) in entries.iter() {
+                let value = (*heapvalue).get_lazy(key);
+                found_keys += value.is_some() as usize;
+                let Some(value) = value.cloned().or_else(|| {
+                    default
+                        .as_ref()
+                        .map(|x| LazyValue::from_value(x.run(previous, &Value::NULL)))
+                }) else {
+                    panic!("missing pattern entry");
+                };
+                scope.set(key.to_string(), value);
+            }
+            if !ignore_unmatched {
+                assert_eq!(found_keys, (*heapvalue).values.len());
+            }
+            if let Some(binding) = binding {
+                scope.set(binding.to_string(), value);
+            }
+            // scope.get("hello");
+            let mut s = String::new();
+            UnpackedValue::fmt_attrset_display(&scope, 0, &mut s, true).unwrap();
+            println!("{s}");
+            Box::leak(Box::new(Scope {
+                values: scope,
+                previous,
+            }))
+        }
+    }
 }
 
 unsafe extern "C" fn scope_create(previous: *mut Scope) -> *mut Scope {
@@ -431,24 +521,30 @@ unsafe extern "C" fn scope_set(
     )
 }
 
-unsafe extern "C" fn scope_inheit_from(
+unsafe extern "C" fn scope_inherit_from(
     scope: *mut Scope,
-    from: Value,
+    from: *const Executable,
     what: *const String,
     whatn: usize,
 ) {
-    let UnpackedValue::Attrset(from) = from.unpack() else {
-        panic!("scope_inherit_from called with non-attrset value");
-    };
     let what = std::slice::from_raw_parts(what, whatn);
     for key in what {
-        (*scope)
-            .values
-            .set(key.to_string(), (*from).get(key).unwrap())
+        Rc::increment_strong_count(from);
+        let from = Rc::from_raw(from);
+        (*scope).values.set(
+            key.to_string(),
+            LazyValue::from_closure(move || {
+                let value = from.run(scope, &Value::NULL).unpack();
+                let UnpackedValue::Attrset(attrs) = value else {
+                    panic!("scope_inherit_from: not an attrset");
+                };
+                (*attrs).get(key).unwrap()
+            }),
+        )
     }
 }
 
-unsafe extern "C" fn scope_inheit_parent(
+unsafe extern "C" fn scope_inherit_parent(
     scope: *mut Scope,
     from: *mut Scope,
     what: *const String,
@@ -458,7 +554,7 @@ unsafe extern "C" fn scope_inheit_parent(
     for key in what {
         (*scope)
             .values
-            .set(key.to_string(), (*from).values.get(key).unwrap())
+            .set(key.to_string(), Scope::lookup(from, key).clone())
     }
 }
 
@@ -483,11 +579,44 @@ unsafe extern "C" fn attrset_set(
     );
 }
 
+unsafe extern "C" fn attrset_inherit_from(
+    attrset: &mut LazyMap,
+    from: &mut LazyMap,
+    what: *const String,
+    whatn: usize,
+) {
+    let what = std::slice::from_raw_parts(what, whatn);
+    for key in what {
+        attrset.set(key.to_string(), (*from).get_lazy(key).unwrap().clone())
+    }
+}
+
+unsafe extern "C" fn attrset_inherit_parent(
+    attrset: &mut LazyMap,
+    from: *mut Scope,
+    what: *const String,
+    whatn: usize,
+) {
+    let what = std::slice::from_raw_parts(what, whatn);
+    for key in what {
+        println!("inherit {key}");
+        attrset.set(key.to_string(), Scope::lookup_lazy(from, key));
+        println!("inherited {key}");
+    }
+}
+
 unsafe extern "C" fn attrset_get(map: &mut LazyMap, name: Value) -> Value {
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("GetAttr called with non-string name")
     };
     map.get(unsafe { (*name).as_str() }).unwrap()
+}
+
+unsafe extern "C" fn attrset_hasattr(map: &mut LazyMap, name: Value) -> Value {
+    let UnpackedValue::String(name) = name.unpack() else {
+        panic!("HasAttr called with non-string name")
+    };
+    UnpackedValue::Bool(map.get_lazy(unsafe { (*name).as_str() }).is_some()).pack()
 }
 
 unsafe extern "C" fn create_function_value(
@@ -519,8 +648,26 @@ unsafe extern "C" fn list_append_value(
     }
 }
 
+unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
+    if let (UnpackedValue::List(a), UnpackedValue::List(b)) = (a.unpack(), b.unpack()) {
+        UnpackedValue::new_list((*a).iter().chain((*b).iter()).cloned().collect()).pack()
+    } else {
+        panic!("concat attempted on non-list operands")
+    }
+}
+
 unsafe extern "C" fn asm_panic(msg: *const i8) {
     panic!("[JITPANIC] {}", CStr::from_ptr(msg).to_string_lossy());
+}
+
+enum Parameter {
+    Ident(String),
+    Pattern {
+        // FIXME: make this option an Option<Program> instead of compiling it during parsing
+        entries: Vec<(String, Option<Executable>)>,
+        binding: Option<String>,
+        ignore_unmatched: bool,
+    },
 }
 
 impl Program {
@@ -528,7 +675,7 @@ impl Program {
         Self { operations: vec![] }
     }
 
-    fn compile(self, param: Option<String>) -> Result<Executable, IcedError> {
+    fn compile(self, param: Option<Parameter>) -> Result<Executable, IcedError> {
         let debug_header = format!("{self:?}");
 
         let code = {
@@ -568,7 +715,9 @@ impl Program {
                 };
             }
 
-            if let Some(param) = param.map(String::leak) {
+            if let Some(param) = param {
+                // FIXME: leak
+                let param = Box::leak(Box::new(param)) as *const Parameter;
                 // rdi = Current function Value (if a function)
                 // rsi = Argument Value (if a function)
 
@@ -580,9 +729,7 @@ impl Program {
                             - ValueKind::Function as i32,
                     ),
                 )?;
-                asm.mov(rcx, rsi)?;
-                asm.mov(rsi, param.as_ptr() as u64)?;
-                asm.mov(rdx, param.len() as u64)?;
+                asm.mov(rdx, param as u64)?;
 
                 call!(rust scope_function_scope);
                 asm.mov(r15, rax)?;
@@ -788,6 +935,67 @@ impl Program {
 
                         asm.set_label(&mut end)?;
                     }
+                    Operation::InheritAttrs(from_stack, names) => {
+                        let names = Vec::leak(names);
+                        let mut not_an_attrset = asm.create_label();
+                        let mut end = asm.create_label();
+                        if from_stack {
+                            assert!(stack_values >= 1);
+                            asm.pop(rsi)?;
+                            stack_values -= 1;
+
+                            asm.mov(rbx, rsi)?;
+                            asm.and(rbx, VALUE_TAG_MASK as i32)?;
+                            asm.cmp(bl, ValueKind::Attrset as u32)?;
+                            asm.jne(not_an_attrset)?;
+                            asm.cmp(rsi, 0)?; // attrset tag also applies to null
+                            asm.je(not_an_attrset)?;
+
+                            asm.add(
+                                rsi,
+                                offset_of!(HeapValue<LazyMap>, value) as i32
+                                    - ValueKind::Attrset as i32,
+                            )?;
+                        } else {
+                            asm.mov(rsi, r15)?;
+                        }
+
+                        assert!(stack_values >= 1);
+                        asm.mov(rdi, qword_ptr(rsp))?;
+
+                        asm.mov(rbx, rdi)?;
+                        asm.and(rbx, VALUE_TAG_MASK as i32)?;
+                        asm.cmp(bl, ValueKind::Attrset as u32)?;
+                        asm.jne(not_an_attrset)?;
+                        asm.cmp(rdi, 0)?; // attrset tag also applies to null
+                        asm.je(not_an_attrset)?;
+
+                        asm.add(
+                            rdi,
+                            offset_of!(HeapValue<LazyMap>, value) as i32
+                                - ValueKind::Attrset as i32,
+                        )?;
+                        asm.mov(rdx, names.as_ptr() as u64)?;
+                        asm.mov(rcx, names.len() as u64)?;
+
+                        if from_stack {
+                            call!(rust attrset_inherit_from);
+                        } else {
+                            call!(rust attrset_inherit_parent);
+                        }
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_an_attrset)?;
+
+                        asm.mov(
+                            rdi,
+                            c"inheritattr called on non-attrset value or non-attrset from".as_ptr()
+                                as u64,
+                        )?;
+                        call!(rust asm_panic);
+
+                        asm.set_label(&mut end)?;
+                    }
                     Operation::GetAttrConsume => {
                         assert!(stack_values >= 2);
                         asm.pop(rsi)?;
@@ -817,6 +1025,41 @@ impl Program {
                         asm.set_label(&mut not_an_attrset)?;
 
                         asm.mov(rdi, c"getattr called on non-attrset value".as_ptr() as u64)?;
+                        call!(rust asm_panic);
+
+                        asm.set_label(&mut end)?;
+                        stack_values += 1;
+                    }
+                    Operation::HasAttrpath(len) => {
+                        assert!(stack_values >= 2);
+                        assert!(len == 1);
+                        asm.pop(rsi)?;
+                        asm.pop(rdi)?;
+                        stack_values -= 2;
+
+                        asm.mov(rcx, rdi)?;
+                        asm.and(rcx, VALUE_TAG_MASK as i32)?;
+                        asm.cmp(cl, ValueKind::Attrset as u32)?;
+                        let mut not_an_attrset = asm.create_label();
+                        asm.jne(not_an_attrset)?;
+                        asm.cmp(rdi, 0)?; // attrset tag also applies to null
+                        asm.je(not_an_attrset)?;
+
+                        asm.add(
+                            rdi,
+                            offset_of!(HeapValue<LazyMap>, value) as i32
+                                - ValueKind::Attrset as i32,
+                        )?;
+
+                        call!(rust attrset_hasattr);
+                        asm.push(rax)?;
+
+                        let mut end = asm.create_label();
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_an_attrset)?;
+
+                        asm.mov(rdi, c"hasattr called on non-attrset value".as_ptr() as u64)?;
                         call!(rust asm_panic);
 
                         asm.set_label(&mut end)?;
@@ -919,18 +1162,28 @@ impl Program {
                         asm.mov(rcx, raw as u64)?;
                         call!(rust scope_set);
                     }
-                    Operation::ScopeInherit(from_stack, names) => {
+                    Operation::ScopeInherit(from, names) => {
                         let names = Vec::leak(names);
-                        if from_stack {
-                            assert!(stack_values >= 1);
-                            asm.pop(rsi)?;
-                            stack_values -= 1;
+                        let has_from = if let Some(program) = from {
+                            // FIXME: leak
+                            asm.mov(
+                                rsi,
+                                Rc::into_raw(Rc::new(program.compile(None)?)) as *const Executable
+                                    as u64,
+                            )?;
+                            true
                         } else {
-                            asm.mov(rsi, r15)?;
-                        }
+                            asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, previous)))?;
+                            false
+                        };
                         asm.mov(rdi, r15)?;
                         asm.mov(rdx, names.as_ptr() as u64)?;
                         asm.mov(rcx, names.len() as u64)?;
+                        if has_from {
+                            call!(rust scope_inherit_from);
+                        } else {
+                            call!(rust scope_inherit_parent);
+                        }
                     }
                     Operation::ScopePop => {
                         // FIXME: make scopes rc or smth
@@ -973,7 +1226,54 @@ impl Program {
                         asm.set_label(&mut end)?;
                         stack_values += 1;
                     }
-                    x => todo!("Operation::{x:?}"),
+                    Operation::Negate => {
+                        assert!(stack_values >= 1);
+                        asm.pop(rdi)?;
+                        stack_values -= 1;
+
+                        let mut end = asm.create_label();
+                        let mut not_an_integer = asm.create_label();
+
+                        asm.mov(rax, rdi)?;
+                        asm.and(rax, VALUE_TAG_MASK as i32)?;
+                        asm.cmp(rax, ValueKind::Integer as i32)?;
+                        asm.jne(not_an_integer)?;
+
+                        asm.shr(rax, 3)?;
+                        asm.neg(rax)?;
+                        asm.shl(rax, 3)?;
+                        asm.or(rax, ValueKind::Integer as i32)?;
+
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_an_integer)?;
+                        asm.mov(
+                            rdi,
+                            c"negate attempted on non-integer value".as_ptr() as u64,
+                        )?;
+                        call!(rust asm_panic);
+
+                        asm.set_label(&mut end)?;
+                        stack_values += 1;
+                    }
+                    Operation::Concat => {
+                        assert!(stack_values >= 2);
+                        asm.pop(rdi)?;
+                        asm.pop(rsi)?;
+                        stack_values -= 2;
+
+                        call!(rust list_concat);
+
+                        asm.push(rax)?;
+                        stack_values += 1;
+                    }
+                    x => {
+                        let dbg = CString::new(format!("TODO: Operation::{x:?}"))
+                            .unwrap()
+                            .into_raw();
+                        asm.mov(rdi, dbg as u64)?;
+                        call!(rust asm_panic);
+                    }
                 }
             }
 
@@ -1122,6 +1422,10 @@ impl UnpackedValue {
 
     fn new_path(value: PathBuf) -> UnpackedValue {
         UnpackedValue::Path(Box::leak(Box::new(HeapValue { refcount: 1, value })))
+    }
+
+    fn new_list(value: Vec<LazyValue>) -> UnpackedValue {
+        UnpackedValue::List(HeapValue::new(value))
     }
 
     fn new_attrset(value: LazyMap) -> UnpackedValue {
@@ -1378,7 +1682,7 @@ impl Value {
     }
 
     #[inline]
-    fn leaking_copy(&self) -> Value {
+    unsafe fn leaking_copy(&self) -> Value {
         Value(self.0)
     }
 
@@ -1581,7 +1885,11 @@ fn import(path: &Path) -> Value {
     let result = rnix::Root::parse(&expr);
     let root = result.tree();
     let mut root_block = Program { operations: vec![] };
-    build_program(root.expr().unwrap(), &mut root_block);
+    build_program(
+        path.parent().unwrap(),
+        root.expr().unwrap(),
+        &mut root_block,
+    );
     let compiled = root_block.compile(None).unwrap();
     ROOT_SCOPE.with(|root| compiled.run(root as *const _ as *mut _, &Value::NULL))
 }
