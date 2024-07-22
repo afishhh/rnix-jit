@@ -1919,23 +1919,21 @@ thread_local! {
 }
 
 fn import(path: &Path) -> Value {
-    let expr = match std::fs::read_to_string(path) {
+    let (here, expr) = match std::fs::read_to_string(path) {
         Err(e) if e.to_string().contains("Is a directory") => {
-            std::fs::read_to_string(path.join("default.nix"))
+            std::fs::read_to_string(path.join("default.nix")).map(|s| (path, s))
         }
-        other => other,
+        other => other.map(|s| (path.parent().unwrap(), s)),
     }
     .unwrap();
 
     let result = rnix::Root::parse(&expr);
     let root = result.tree();
     let mut root_block = Program { operations: vec![] };
-    build_program(
-        path.parent().unwrap(),
-        root.expr().unwrap(),
-        &mut root_block,
-    );
+    build_program(here, root.expr().unwrap(), &mut root_block);
     let compiled = root_block.compile(None).unwrap();
+    // FIXME: the immutable reference created by .with() WILL alias with mutable dereferences of
+    //        *mut Scope (maybe UnsafeCell<> values?)
     ROOT_SCOPE.with(|root| compiled.run(root as *const _ as *mut _, &Value::NULL))
 }
 
