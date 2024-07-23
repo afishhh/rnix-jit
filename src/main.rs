@@ -27,7 +27,7 @@ enum Operation {
     // This is different from Push because this also sets the parent scope of the function
     PushFunction(Parameter, Program),
     CreateAttrset { rec: bool },
-    InheritAttrs(bool, Vec<String>),
+    InheritAttrs(Option<Program>, Vec<String>),
     SetAttrpath(usize, Program),
     GetAttrConsume,
     HasAttrpath(usize),
@@ -256,14 +256,13 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
                 rec: x.rec_token().is_some(),
             });
             for inherit in x.inherits() {
-                let has_source = if let Some(source) = inherit.from().and_then(|f| f.expr()) {
-                    build_program(here, source, program);
-                    true
+                let source = if let Some(source) = inherit.from().and_then(|f| f.expr()) {
+                    Some(create_program(here, source))
                 } else {
-                    false
+                    None
                 };
                 program.operations.push(Operation::InheritAttrs(
-                    has_source,
+                    source,
                     inherit.attrs().map(attr_assert_const).collect(),
                 ));
             }
@@ -359,8 +358,6 @@ impl Scope {
             })) as *mut Scope;
             (*scope_ptr).values =
                 (scope_ptr as *const u8).add(offset_of!(Scope, storage.Scope.0)) as *const _;
-            dbg!(scope_ptr);
-            dbg!((*scope_ptr).values);
             scope_ptr
         }
     }
@@ -376,7 +373,8 @@ impl Scope {
     unsafe fn lookup(mut scope: *mut Scope, name: &str) -> Value {
         loop {
             let mut scope_debug = String::new();
-            UnpackedValue::fmt_attrset_display(&*(*scope).values, 0, &mut scope_debug, true).unwrap();
+            UnpackedValue::fmt_attrset_display(&*(*scope).values, 0, &mut scope_debug, true)
+                .unwrap();
             eprintln!("{scope:?} {name} {}", scope_debug);
             match (*scope).get(name) {
                 Some(value) => return value.clone(),
@@ -491,27 +489,24 @@ unsafe extern "C" fn scope_set(
     };
 }
 
-unsafe extern "C" fn scope_inherit_from(
+unsafe extern "C" fn map_inherit_from(
     scope: *mut Scope,
+    map: &mut ValueMap,
     from: *const Executable,
     what: *const String,
     whatn: usize,
 ) {
     let what = std::slice::from_raw_parts(what, whatn);
-    let values = match &mut (*scope).storage {
-        ScopeStorage::Attrset => panic!("scope_inherit_from called on Attrset Scope"),
-        ScopeStorage::Scope(values) => values,
-    };
 
     for key in what {
         Rc::increment_strong_count(from);
         let from = Rc::from_raw(from);
-        values.insert(
+        map.insert(
             key.to_string(),
             UnpackedValue::Lazy(LazyValue::from_closure(move || {
                 let value = from.run(scope, &Value::NULL).unpack().evaluate();
                 let UnpackedValue::Attrset(attrs) = value else {
-                    panic!("scope_inherit_from: not an attrset");
+                    panic!("map_inherit_from: not an attrset");
                 };
                 (*attrs.get()).get(key).unwrap().clone()
             }))
@@ -556,18 +551,6 @@ unsafe extern "C" fn attrset_set(
     );
 }
 
-unsafe extern "C" fn attrset_inherit_from(
-    attrset: &mut ValueMap,
-    from: &mut ValueMap,
-    what: *const String,
-    whatn: usize,
-) {
-    let what = std::slice::from_raw_parts(what, whatn);
-    for key in what {
-        attrset.insert(key.to_string(), (*from).get(key).unwrap().clone());
-    }
-}
-
 unsafe extern "C" fn attrset_inherit_parent(
     attrset: &mut ValueMap,
     from: *mut Scope,
@@ -576,9 +559,7 @@ unsafe extern "C" fn attrset_inherit_parent(
 ) {
     let what = std::slice::from_raw_parts(what, whatn);
     for key in what {
-        // println!("inherit {key}");
         attrset.insert(key.to_string(), Scope::lookup(from, key));
-        // println!("inherited {key}");
     }
 }
 
@@ -1022,45 +1003,34 @@ impl Program {
 
                         asm.set_label(&mut end)?;
                     }
-                    Operation::InheritAttrs(from_stack, names) => {
+                    Operation::InheritAttrs(source, names) => {
                         let names = Vec::leak(names);
                         let mut not_an_attrset = asm.create_label();
-                        let mut end = asm.create_label();
-                        if from_stack {
-                            assert!(stack_values >= 1);
-                            asm.pop(r12)?;
-                            stack_values -= 1;
-                            unlazy!(r12, rdi);
-
-                            asm.mov(rbx, r12)?;
-                            asm.and(rbx, r14)?;
-                            asm.cmp(rbx, ValueKind::Attrset as i32)?;
-                            asm.jne(not_an_attrset)?;
-
-                            asm.sub(r12, ValueKind::Attrset as i32)?;
-                        } else {
-                            asm.mov(r12, r15)?;
-                        }
 
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
-                        unlazy!(rdi, rcx);
 
                         asm.mov(rbx, rdi)?;
                         asm.and(rbx, r14)?;
                         asm.cmp(rbx, ValueKind::Attrset as i32)?;
                         asm.jne(not_an_attrset)?;
-
                         asm.sub(rdi, ValueKind::Attrset as i32)?;
-                        asm.mov(rsi, r12)?;
-                        asm.mov(rdx, names.as_ptr() as u64)?;
-                        asm.mov(rcx, names.len() as u64)?;
 
-                        if from_stack {
-                            call!(rust attrset_inherit_from);
+                        let mut end = asm.create_label();
+                        if let Some(program) = source {
+                            asm.mov(rsi, rdi)?;
+                            asm.mov(rdi, r15)?;
+                            asm.mov(rdx, intern_executable(program.compile(None)?) as u64)?;
+                            asm.mov(rcx, names.as_ptr() as u64)?;
+                            asm.mov(r8, names.len() as u64)?;
+                            call!(rust map_inherit_from);
                         } else {
+                            asm.mov(rsi, r15)?;
+                            asm.mov(rdx, names.as_ptr() as u64)?;
+                            asm.mov(rcx, names.len() as u64)?;
                             call!(rust attrset_inherit_parent);
-                        }
+                        };
+
                         asm.jmp(end)?;
 
                         asm.set_label(&mut not_an_attrset)?;
@@ -1232,21 +1202,20 @@ impl Program {
                     }
                     Operation::ScopeInherit(from, names) => {
                         let names = Vec::leak(names);
-                        let has_from = if let Some(program) = from {
-                            asm.mov(rsi, intern_executable(program.compile(None)?) as u64)?;
-                            true
+                        if let Some(program) = from {
+                            asm.mov(rdi, r15)?;
+                            asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, values)))?;
+                            asm.mov(rdx, intern_executable(program.compile(None)?) as u64)?;
+                            asm.mov(rcx, names.as_ptr() as u64)?;
+                            asm.mov(r8, names.len() as u64)?;
+                            call!(rust map_inherit_from);
                         } else {
                             asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, previous)))?;
-                            false
-                        };
-                        asm.mov(rdi, r15)?;
-                        asm.mov(rdx, names.as_ptr() as u64)?;
-                        asm.mov(rcx, names.len() as u64)?;
-                        if has_from {
-                            call!(rust scope_inherit_from);
-                        } else {
+                            asm.mov(rdi, r15)?;
+                            asm.mov(rdx, names.as_ptr() as u64)?;
+                            asm.mov(rcx, names.len() as u64)?;
                             call!(rust scope_inherit_parent);
-                        }
+                        };
                     }
                     Operation::ScopePop => {
                         // FIXME: make scopes rc or smth
@@ -1485,7 +1454,7 @@ impl LazyValueImpl {
                 LAZY_DEPTH.with(|x| unsafe {
                     let depth = &mut *x.get();
                     *depth += 1;
-                    if *depth > 1000 {
+                    if *depth > 100 {
                         panic!("max lazy JIT depth exceeded");
                     };
                 });
@@ -2013,6 +1982,9 @@ macro_rules! value_impl_number_comparison {
                 (UnpackedValue::Integer(a), UnpackedValue::Integer(b)) => {
                     UnpackedValue::Bool(a $operator b).pack()
                 }
+                (UnpackedValue::String(a), UnpackedValue::String(b)) => {
+                    UnpackedValue::Bool(a $operator b).pack()
+                }
                 (a, b) => panic!(
                     concat!(stringify!($operator), " is not supported between values of type {} and {}"),
                     a.kind(), b.kind()
@@ -2137,6 +2109,24 @@ fn create_root_scope() -> *mut Scope {
                 UnpackedValue::new_function(|message| {
                     println!("trace: {message}");
                     UnpackedValue::new_function(|value| value).pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "elem".to_string(),
+                UnpackedValue::new_function(|needle| {
+                    UnpackedValue::new_function(move |list| {
+                        let list = extract_typed!("elem", List(list));
+                        for value in unsafe { (*list.get()).iter() } {
+                            // TODO: less cloning
+                            if value.clone().equal(needle.clone()).0 == Value::TRUE.0 {
+                                return Value::TRUE;
+                            }
+                        }
+                        Value::FALSE
+                    })
+                    .pack()
                 })
                 .pack(),
             );
