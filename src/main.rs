@@ -11,7 +11,7 @@ use std::{
     ffi::{CStr, CString},
     fmt::{Debug, Display, Write},
     mem::{offset_of, MaybeUninit},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     os::raw::c_void,
     path::{Path, PathBuf},
     rc::Rc,
@@ -294,6 +294,11 @@ type ValueList = Vec<Value>;
 
 #[derive(Debug)]
 struct Executable {
+    // FIXME: this doesn't seem to work
+    //        Do we have reference cycles here?
+    _referenced_strings: Vec<String>,
+    _referenced_executables: Vec<Rc<Executable>>,
+    _parameter: Option<Box<Parameter>>,
     len: usize,
     code: extern "C" fn(Value, Value) -> Value,
 }
@@ -321,7 +326,7 @@ impl Drop for Executable {
 enum ScopeStorage {
     // Used for recursive attribute sets
     #[allow(dead_code)] // Used dynamically via JIT
-    Attrset(*mut HeapValue<ValueMap>),
+    Attrset,
     Scope(ValueMap),
 }
 
@@ -348,6 +353,14 @@ impl Scope {
         }
     }
 
+    fn from_attrs(map: Rc<UnsafeCell<ValueMap>>, previous: *mut Scope) -> *mut Scope {
+        Box::leak(Box::new(Scope {
+            values: unsafe { (*Rc::<UnsafeCell<ValueMap>>::into_raw(map)).get() },
+            previous,
+            storage: ScopeStorage::Attrset,
+        }))
+    }
+
     unsafe fn lookup(mut scope: *mut Scope, name: &str) -> Value {
         loop {
             match dbg!((*dbg!(scope)).get(dbg!(name))) {
@@ -359,6 +372,14 @@ impl Scope {
                     }
                 }
             }
+        }
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        if matches!(self.storage, ScopeStorage::Attrset) {
+            unsafe { Rc::decrement_strong_count(self.values) }
         }
     }
 }
@@ -396,13 +417,13 @@ unsafe extern "C" fn scope_function_scope(
             binding,
             ignore_unmatched,
         } => {
-            let UnpackedValue::Attrset(heapvalue) = value.clone().unpack() else {
+            let UnpackedValue::Attrset(heapvalue) = value.unpack() else {
                 panic!("cannot unpack non-attrset value in pattern parameter");
             };
             let mut scope = ValueMap::new();
             let mut found_keys = 0;
             for (key, default) in entries.iter() {
-                let value = (*heapvalue).get(key);
+                let value = (*heapvalue.get()).get(key);
                 found_keys += value.is_some() as usize;
                 let Some(value) = value
                     .cloned()
@@ -413,7 +434,7 @@ unsafe extern "C" fn scope_function_scope(
                 scope.insert(key.to_string(), value);
             }
             if !ignore_unmatched {
-                assert_eq!(found_keys, (*heapvalue).len());
+                assert_eq!(found_keys, (*heapvalue.get()).len());
             }
             if let Some(binding) = binding {
                 scope.insert(binding.to_string(), value);
@@ -432,14 +453,10 @@ unsafe extern "C" fn scope_create(previous: *mut Scope) -> *mut Scope {
 }
 
 unsafe extern "C" fn scope_create_rec(
-    attrset: *mut HeapValue<ValueMap>,
+    attrset: *mut UnsafeCell<ValueMap>,
     previous: *mut Scope,
 ) -> *mut Scope {
-    Box::leak(Box::new(Scope {
-        values: &(*attrset).value as *const ValueMap,
-        previous,
-        storage: ScopeStorage::Attrset(attrset),
-    }))
+    Scope::from_attrs(Rc::from_raw(attrset), previous)
 }
 
 unsafe extern "C" fn scope_set(
@@ -451,7 +468,7 @@ unsafe extern "C" fn scope_set(
     let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(key, key_len));
     Rc::increment_strong_count(value);
     match &mut (*scope).storage {
-        ScopeStorage::Attrset(_) => panic!("scope_set called on Attrset Scope"),
+        ScopeStorage::Attrset => panic!("scope_set called on Attrset Scope"),
         ScopeStorage::Scope(values) => values.insert(
             name.to_string(),
             UnpackedValue::Lazy(LazyValue::from_jit(scope, Rc::from_raw(value))).pack(),
@@ -467,7 +484,7 @@ unsafe extern "C" fn scope_inherit_from(
 ) {
     let what = std::slice::from_raw_parts(what, whatn);
     let values = match &mut (*scope).storage {
-        ScopeStorage::Attrset(_) => panic!("scope_inherit_from called on Attrset Scope"),
+        ScopeStorage::Attrset => panic!("scope_inherit_from called on Attrset Scope"),
         ScopeStorage::Scope(values) => values,
     };
 
@@ -481,7 +498,7 @@ unsafe extern "C" fn scope_inherit_from(
                 let UnpackedValue::Attrset(attrs) = value else {
                     panic!("scope_inherit_from: not an attrset");
                 };
-                (*attrs).get(key).unwrap().clone()
+                (*attrs.get()).get(key).unwrap().clone()
             }))
             .pack(),
         );
@@ -496,7 +513,7 @@ unsafe extern "C" fn scope_inherit_parent(
 ) {
     let what = std::slice::from_raw_parts(what, whatn);
     let values = match &mut (*scope).storage {
-        ScopeStorage::Attrset(_) => panic!("scope_inherit_from called on Attrset Scope"),
+        ScopeStorage::Attrset => panic!("scope_inherit_from called on Attrset Scope"),
         ScopeStorage::Scope(values) => values,
     };
     for key in what {
@@ -505,7 +522,7 @@ unsafe extern "C" fn scope_inherit_parent(
 }
 
 unsafe extern "C" fn attrset_create() -> Value {
-    UnpackedValue::Attrset(HeapValue::new(ValueMap::new())).pack()
+    UnpackedValue::new_attrset(ValueMap::new()).pack()
 }
 
 unsafe extern "C" fn attrset_set(
@@ -517,10 +534,9 @@ unsafe extern "C" fn attrset_set(
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("SetAttr called with non-string name")
     };
-    let name = unsafe { (*name).as_str() };
     Rc::increment_strong_count(value);
     map.insert(
-        name.to_string(),
+        Rc::unwrap_or_clone(name),
         UnpackedValue::Lazy(LazyValue::from_jit(scope, Rc::from_raw(value))).pack(),
     );
 }
@@ -552,17 +568,17 @@ unsafe extern "C" fn attrset_inherit_parent(
 }
 
 unsafe extern "C" fn attrset_get(map: &mut ValueMap, name: Value) -> Value {
-    let UnpackedValue::String(name) = name.clone().unpack() else {
-        panic!("GetAttr called with non-string name {map:?} {name:?}")
+    let UnpackedValue::String(name) = name.into_unpacked() else {
+        panic!("GetAttr called with non-string name")
     };
-    map.get(unsafe { (*name).as_str() }).unwrap().clone()
+    map.get(name.as_str()).unwrap().clone()
 }
 
 unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Value) -> Value {
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("GetAttr called with non-string name")
     };
-    map.entry(unsafe { (*name).to_string() })
+    map.entry(Rc::unwrap_or_clone(name))
         .or_insert_with(|| UnpackedValue::new_attrset(ValueMap::new()).pack())
         .clone()
 }
@@ -571,7 +587,7 @@ unsafe extern "C" fn attrset_hasattr(map: &mut ValueMap, name: Value) -> Value {
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("HasAttr called with non-string name")
     };
-    UnpackedValue::Bool(map.get(unsafe { (*name).as_str() }).is_some()).pack()
+    UnpackedValue::Bool(map.get(name.as_str()).is_some()).pack()
 }
 
 unsafe extern "C" fn create_function_value(
@@ -579,7 +595,7 @@ unsafe extern "C" fn create_function_value(
     scope: *mut Scope,
 ) -> Value {
     Rc::increment_strong_count(executable);
-    UnpackedValue::Function(HeapValue::new(Function {
+    UnpackedValue::Function(Rc::new(Function {
         call: (*executable).code,
         executable: Some(Rc::from_raw(executable)),
         builtin_closure: None,
@@ -589,7 +605,7 @@ unsafe extern "C" fn create_function_value(
 }
 
 unsafe extern "C" fn list_create() -> Value {
-    UnpackedValue::List(HeapValue::new(vec![])).pack()
+    UnpackedValue::new_list(Vec::new()).pack()
 }
 
 unsafe extern "C" fn list_append_value(
@@ -605,7 +621,14 @@ unsafe extern "C" fn list_append_value(
 
 unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
     if let (UnpackedValue::List(a), UnpackedValue::List(b)) = (a.unpack(), b.unpack()) {
-        UnpackedValue::new_list((*a).iter().chain((*b).iter()).cloned().collect()).pack()
+        UnpackedValue::new_list(
+            (*a.get())
+                .iter()
+                .chain((*b.get()).iter())
+                .cloned()
+                .collect(),
+        )
+        .pack()
     } else {
         panic!("concat attempted on non-list operands")
     }
@@ -619,6 +642,7 @@ unsafe extern "C" fn asm_panic(msg: *const i8) {
     panic!("[JITPANIC] {}", CStr::from_ptr(msg).to_string_lossy());
 }
 
+#[derive(Debug)]
 enum Parameter {
     Ident(String),
     Pattern {
@@ -637,6 +661,22 @@ impl Program {
     fn compile(self, param: Option<Parameter>) -> Result<Executable, IcedError> {
         let debug_header = format!("{self:?}");
 
+        let mut referenced_executables = vec![];
+        let mut intern_executable = |executable: Executable| {
+            let rc = Rc::new(executable);
+            let ptr = Rc::as_ptr(&rc);
+            referenced_executables.push(rc);
+            ptr
+        };
+        let mut referenced_strings = vec![];
+        let mut intern_string = |string: String| {
+            // erase lifetime
+            // SATETY: not very
+            let ptr = unsafe { &*(string.as_str() as *const str) };
+            referenced_strings.push(string);
+            ptr
+        };
+        let parameter = param.map(Box::new);
         let code = {
             let mut asm = CodeAssembler::new(64)?;
 
@@ -678,18 +718,15 @@ impl Program {
                 };
             }
 
-            if let Some(param) = param {
-                // FIXME: leak
-                let param = Box::leak(Box::new(param)) as *const Parameter;
+            if let Some(ref parameter) = parameter {
+                let param = &**parameter as *const Parameter;
                 // rdi = Current function Value (if a function)
                 // rsi = Argument Value (if a function)
 
                 asm.mov(
                     rdi,
                     qword_ptr(
-                        rdi + offset_of!(HeapValue<Function>, value)
-                            + offset_of!(Function, parent_scope)
-                            - ValueKind::Function as i32,
+                        rdi + offset_of!(Function, parent_scope) - ValueKind::Function as i32,
                     ),
                 )?;
                 asm.mov(rdx, param as u64)?;
@@ -829,8 +866,7 @@ impl Program {
                         stack_values += 1;
                     }
                     Operation::PushFunction(exec) => {
-                        // FIXME: leak
-                        let raw = Rc::into_raw(Rc::new(exec));
+                        let raw = intern_executable(exec);
                         asm.mov(rdi, raw as u64)?;
                         asm.mov(rsi, r15)?;
                         call!(rust create_function_value);
@@ -898,8 +934,7 @@ impl Program {
                         }
                     }
                     Operation::SetAttrpath(components, value_program) => {
-                        // FIXME: leak
-                        let raw = Rc::into_raw(Rc::new(value_program.compile(None)?));
+                        let raw = intern_executable(value_program.compile(None)?);
 
                         assert!(stack_values > components);
                         asm.mov(rdi, qword_ptr(rsp + (8 * components)))?;
@@ -911,11 +946,7 @@ impl Program {
                             asm.cmp(rbx, ValueKind::Attrset as i32)?;
                             asm.jne(not_an_attrset)?;
 
-                            asm.add(
-                                rdi,
-                                offset_of!(HeapValue<ValueMap>, value) as i32
-                                    - ValueKind::Attrset as i32,
-                            )?;
+                            asm.sub(rdi, ValueKind::Attrset as i32)?;
 
                             asm.pop(rsi)?;
                             stack_values -= 1;
@@ -937,11 +968,7 @@ impl Program {
                         asm.cmp(rbx, ValueKind::Attrset as i32)?;
                         asm.jne(not_an_attrset)?;
 
-                        asm.add(
-                            rdi,
-                            offset_of!(HeapValue<ValueMap>, value) as i32
-                                - ValueKind::Attrset as i32,
-                        )?;
+                        asm.sub(rdi, ValueKind::Attrset as i32)?;
                         asm.mov(rsi, r15)?;
                         asm.mov(rdx, raw as u64)?;
                         asm.pop(rcx)?;
@@ -974,11 +1001,7 @@ impl Program {
                             asm.cmp(rbx, ValueKind::Attrset as i32)?;
                             asm.jne(not_an_attrset)?;
 
-                            asm.add(
-                                r12,
-                                offset_of!(HeapValue<ValueMap>, value) as i32
-                                    - ValueKind::Attrset as i32,
-                            )?;
+                            asm.sub(r12, ValueKind::Attrset as i32)?;
                         } else {
                             asm.mov(r12, r15)?;
                         }
@@ -992,11 +1015,7 @@ impl Program {
                         asm.cmp(rbx, ValueKind::Attrset as i32)?;
                         asm.jne(not_an_attrset)?;
 
-                        asm.add(
-                            rdi,
-                            offset_of!(HeapValue<ValueMap>, value) as i32
-                                - ValueKind::Attrset as i32,
-                        )?;
+                        asm.sub(rdi, ValueKind::Attrset as i32)?;
                         asm.mov(rsi, r12)?;
                         asm.mov(rdx, names.as_ptr() as u64)?;
                         asm.mov(rcx, names.len() as u64)?;
@@ -1035,11 +1054,7 @@ impl Program {
                         asm.cmp(rcx, ValueKind::Attrset as i32)?;
                         asm.jne(not_an_attrset)?;
 
-                        asm.add(
-                            rdi,
-                            offset_of!(HeapValue<ValueMap>, value) as i32
-                                - ValueKind::Attrset as i32,
-                        )?;
+                        asm.sub(rdi, ValueKind::Attrset as i32)?;
 
                         call!(rust attrset_get);
                         asm.push(rax)?;
@@ -1071,11 +1086,7 @@ impl Program {
                         asm.cmp(rcx, ValueKind::Attrset as i32)?;
                         asm.jne(not_an_attrset)?;
 
-                        asm.add(
-                            rdi,
-                            offset_of!(HeapValue<ValueMap>, value) as i32
-                                - ValueKind::Attrset as i32,
-                        )?;
+                        asm.sub(rdi, ValueKind::Attrset as i32)?;
 
                         call!(rust attrset_hasattr);
                         asm.push(rax)?;
@@ -1112,8 +1123,7 @@ impl Program {
                         asm.mov(
                             rax,
                             qword_ptr(
-                                rbx + offset_of!(HeapValue<Function>, value) as i32
-                                    + offset_of!(Function, call) as i32
+                                rbx + offset_of!(Function, call) as i32
                                     - ValueKind::Function as i32,
                             ),
                         )?;
@@ -1130,7 +1140,7 @@ impl Program {
                         stack_values += 1;
                     }
                     Operation::Load(name) => {
-                        let name = String::leak(name);
+                        let name = intern_string(name);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, name.as_ptr() as u64)?;
                         asm.mov(rdx, name.len() as u64)?;
@@ -1144,8 +1154,7 @@ impl Program {
                         stack_values += 1;
                     }
                     Operation::ListAppend(value_program) => {
-                        // FIXME: leak
-                        let raw = Rc::into_raw(Rc::new(value_program.compile(None)?));
+                        let raw = intern_executable(value_program.compile(None)?);
 
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
@@ -1158,10 +1167,7 @@ impl Program {
                         asm.cmp(al, ValueKind::List as u32)?;
                         asm.jne(not_a_list)?;
 
-                        asm.add(
-                            rdi,
-                            offset_of!(HeapValue<ValueList>, value) as i32 - ValueKind::List as i32,
-                        )?;
+                        asm.sub(rdi, ValueKind::List as i32)?;
                         asm.mov(rsi, r15)?;
                         asm.mov(rdx, raw as u64)?;
                         call!(rust list_append_value);
@@ -1180,9 +1186,8 @@ impl Program {
                         asm.mov(r15, rax)?;
                     }
                     Operation::ScopeSet(name, value_program) => {
-                        let name = String::leak(name);
-                        // FIXME: leak
-                        let raw = Rc::into_raw(Rc::new(value_program.compile(None)?));
+                        let name = intern_string(name);
+                        let raw = intern_executable(value_program.compile(None)?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, name.as_ptr() as u64)?;
                         asm.mov(rdx, name.len() as u64)?;
@@ -1192,8 +1197,7 @@ impl Program {
                     Operation::ScopeInherit(from, names) => {
                         let names = Vec::leak(names);
                         let has_from = if let Some(program) = from {
-                            // FIXME: leak
-                            asm.mov(rsi, Rc::into_raw(Rc::new(program.compile(None)?)) as u64)?;
+                            asm.mov(rsi, intern_executable(program.compile(None)?) as u64)?;
                             true
                         } else {
                             asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, previous)))?;
@@ -1213,9 +1217,8 @@ impl Program {
                         asm.mov(r15, qword_ptr(r15 + offset_of!(Scope, previous)))?;
                     }
                     Operation::IfElse(if_true, if_false) => {
-                        // FIXME: leak
-                        let if_true = Rc::into_raw(Rc::new(if_true.compile(None)?));
-                        let if_false = Rc::into_raw(Rc::new(if_false.compile(None)?));
+                        let if_true = intern_executable(if_true.compile(None)?);
+                        let if_false = intern_executable(if_false.compile(None)?);
 
                         assert!(stack_values >= 1);
                         asm.pop(rsi)?;
@@ -1302,6 +1305,7 @@ impl Program {
                 }
             }
 
+            assert_eq!(stack_values, 1);
             asm.pop(rax)?;
 
             // callee saved registers
@@ -1344,6 +1348,9 @@ impl Program {
                 panic!("mprotect failed");
             }
             Ok(Executable {
+                _referenced_executables: referenced_executables,
+                _referenced_strings: referenced_strings,
+                _parameter: parameter,
                 code: std::mem::transmute(code_mem),
                 len: code.len(),
             })
@@ -1377,34 +1384,6 @@ enum ValueKind {
     // NOTE: These are no longer tag values, instead these are packed into Attrset tags
     Lazy, // a pointer to LazyValue
     Null, // all zeroes: an attrset which is a null pointer
-}
-
-#[repr(C)]
-struct HeapValue<T = ()> {
-    // NOTE: Currently unused
-    // TODO: Implement reference counted memory management
-    refcount: u64,
-    value: T,
-}
-
-impl<T> HeapValue<T> {
-    fn new(value: T) -> *mut HeapValue<T> {
-        Box::leak(Box::new(Self { refcount: 1, value }))
-    }
-}
-
-impl<T> Deref for HeapValue<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl<T> DerefMut for HeapValue<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
-    }
 }
 
 #[repr(C)]
@@ -1505,14 +1484,15 @@ impl LazyValue {
     }
 }
 
+#[derive(Clone)]
 enum UnpackedValue {
     Integer(i64),
     Bool(bool),
-    List(*mut HeapValue<ValueList>),
-    Attrset(*mut HeapValue<ValueMap>),
-    String(*mut HeapValue<String>),
-    Function(*mut HeapValue<Function>),
-    Path(*mut HeapValue<PathBuf>),
+    List(Rc<UnsafeCell<ValueList>>),
+    Attrset(Rc<UnsafeCell<ValueMap>>),
+    String(Rc<String>),
+    Function(Rc<Function>),
+    Path(Rc<PathBuf>),
     Lazy(LazyValue),
     Null,
 }
@@ -1535,7 +1515,7 @@ impl Display for ValueKind {
 }
 
 unsafe extern "C" fn call_builtin(fun: Value, value: Value) -> Value {
-    let this = (fun.0 & !VALUE_TAG_MASK) as *mut HeapValue<Function>;
+    let this = (fun.0 & !VALUE_TAG_MASK) as *mut Function;
     // println!(
     //     "call_builtin HeapValue:{:?} arg:{value:?}",
     //     this as *const _
@@ -1545,23 +1525,23 @@ unsafe extern "C" fn call_builtin(fun: Value, value: Value) -> Value {
 
 impl UnpackedValue {
     fn new_string(value: String) -> UnpackedValue {
-        UnpackedValue::String(Box::leak(Box::new(HeapValue { refcount: 1, value })))
+        UnpackedValue::String(Rc::new(value))
     }
 
     fn new_path(value: PathBuf) -> UnpackedValue {
-        UnpackedValue::Path(Box::leak(Box::new(HeapValue { refcount: 1, value })))
+        UnpackedValue::Path(Rc::new(value))
     }
 
     fn new_list(value: ValueList) -> UnpackedValue {
-        UnpackedValue::List(HeapValue::new(value))
+        UnpackedValue::List(Rc::new(UnsafeCell::new(value)))
     }
 
     fn new_attrset(value: ValueMap) -> UnpackedValue {
-        UnpackedValue::Attrset(Box::leak(Box::new(HeapValue { refcount: 1, value })))
+        UnpackedValue::Attrset(Rc::new(UnsafeCell::new(value)))
     }
 
     fn new_function(function: impl FnMut(Value) -> Value + 'static) -> UnpackedValue {
-        UnpackedValue::Function(HeapValue::new(Function {
+        UnpackedValue::Function(Rc::new(Function {
             call: call_builtin,
             executable: None,
             builtin_closure: Some(Box::new(function)),
@@ -1586,13 +1566,7 @@ impl UnpackedValue {
     fn pack(self) -> Value {
         macro_rules! pack_ptr {
             ($ptr: ident, $kind: ident) => {{
-                // println!(
-                //     "HeapValue<> PACKED {:x} = {}",
-                //     ($ptr as u64),
-                //     ValueKind::$kind
-                // );
-                assert!(($ptr as u64).trailing_zeros() >= VALUE_TAG_WIDTH.into());
-                Value(($ptr as u64) | (ValueKind::$kind as u64))
+                Value((Rc::into_raw($ptr) as u64) | (ValueKind::$kind as u64))
             }};
         }
         match self {
@@ -1612,20 +1586,14 @@ impl UnpackedValue {
             Self::List(ptr) => pack_ptr!(ptr, List),
             Self::Attrset(ptr) => pack_ptr!(ptr, Attrset),
             Self::Function(ptr) => pack_ptr!(ptr, Function),
-            Self::Lazy(ptr) => unsafe {
-                let raw = Rc::into_raw(ptr.0.clone());
-                for i in 0..200 {
-                    Rc::increment_strong_count(raw);
-                }
-                Value(Rc::into_raw(ptr.0) as u64 | ATTRSET_TAG_LAZY)
-            },
+            Self::Lazy(ptr) => Value(Rc::into_raw(ptr.0) as u64 | ATTRSET_TAG_LAZY),
             Self::Null => Value::NULL,
         }
     }
 
     fn evaluate(self) -> UnpackedValue {
         if let UnpackedValue::Lazy(lazy) = self {
-            lazy.evaluate().clone().unpack()
+            lazy.evaluate().unpack()
         } else {
             self
         }
@@ -1702,15 +1670,17 @@ impl UnpackedValue {
             }
             Self::String(value) => {
                 if depth == 0 {
-                    write!(f, "{}", unsafe { (**value).as_str() })
+                    write!(f, "{}", value)
                 } else {
-                    write!(f, "{:?}", unsafe { (**value).as_str() })
+                    write!(f, "{:?}", value)
                 }
             }
-            Self::Path(value) => write!(f, "{}", unsafe { (**value).display() }),
-            Self::List(value) => Self::fmt_list_display(unsafe { &**value }, depth, f, false),
+            Self::Path(value) => write!(f, "{}", value.display()),
+            Self::List(value) => {
+                Self::fmt_list_display(unsafe { &*(value.get()) }, depth, f, false)
+            }
             Self::Attrset(value) => {
-                Self::fmt_attrset_display(unsafe { &(**value).value }, depth, f, false)
+                Self::fmt_attrset_display(unsafe { &*(value.get()) }, depth, f, false)
             }
             Self::Function(_) => write!(f, "<function>"),
             Self::Lazy(x) => {
@@ -1733,20 +1703,19 @@ impl UnpackedValue {
                 write!(f, "{value}")
             }
             Self::String(value) => {
-                let value = unsafe { (**value).as_str() };
-                write!(f, "{value:?}")
+                write!(f, "{:?}", value.as_str())
             }
             Self::Path(value) => {
-                write!(f, "{}", unsafe { (**value).display() })
+                write!(f, "{}", value.display())
             }
-            Self::List(value) => Self::fmt_list_display(unsafe { &**value }, depth, f, true),
+            Self::List(value) => Self::fmt_list_display(unsafe { &*(value.get()) }, depth, f, true),
             Self::Attrset(value) => {
-                Self::fmt_attrset_display(unsafe { &(**value) }, depth, f, true)
+                Self::fmt_attrset_display(unsafe { &*(value.get()) }, depth, f, true)
             }
             Self::Function(_) => write!(f, "<function>"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
-                    x.clone().unpack().fmt_display_rec(depth, f)
+                    x.unpack().fmt_display_rec(depth, f)
                 } else {
                     write!(f, "...")
                 }
@@ -1765,31 +1734,6 @@ impl Display for UnpackedValue {
 impl Debug for UnpackedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.fmt_debug_rec(0, f)
-    }
-}
-
-impl Clone for UnpackedValue {
-    // TODO: refcnt
-    fn clone(&self) -> Self {
-        macro_rules! clone_ptr {
-            ($arg: ident, $kind: ident) => {{
-                unsafe {
-                    (**$arg).refcount += 1;
-                };
-                Self::$kind(*$arg)
-            }};
-        }
-        match self {
-            Self::Integer(value) => Self::Integer(*value),
-            Self::Bool(value) => Self::Bool(*value),
-            Self::Attrset(ptr) => clone_ptr!(ptr, Attrset),
-            Self::String(ptr) => clone_ptr!(ptr, String),
-            Self::Path(ptr) => clone_ptr!(ptr, Path),
-            Self::List(ptr) => clone_ptr!(ptr, List),
-            Self::Function(ptr) => clone_ptr!(ptr, Function),
-            Self::Lazy(ptr) => Self::Lazy(ptr.clone()),
-            Self::Null => Self::Null,
-        }
     }
 }
 
@@ -1813,10 +1757,43 @@ impl Value {
         unsafe { std::mem::transmute(value as u8) }
     }
 
-    fn unpack(self) -> UnpackedValue {
+    fn unpack(&self) -> UnpackedValue {
         macro_rules! unpack_ptr {
             ($kind: ident) => {
-                UnpackedValue::$kind((self.0 & !VALUE_TAG_MASK) as *mut _)
+                UnpackedValue::$kind(unsafe {
+                    let raw = (self.0 & !VALUE_TAG_MASK) as *mut _;
+                    Rc::increment_strong_count(raw);
+                    Rc::from_raw(raw)
+                })
+            };
+        }
+        match self.kind() {
+            ValueKind::Integer => {
+                UnpackedValue::Integer(unsafe { std::mem::transmute(self.0 >> VALUE_TAG_WIDTH) })
+            }
+            ValueKind::Double => todo!(),
+            ValueKind::Bool => UnpackedValue::Bool(self.0 == 0b1000 | (ValueKind::Bool as u64)),
+            ValueKind::String => unpack_ptr!(String),
+            ValueKind::Path => unpack_ptr!(Path),
+            ValueKind::List => unpack_ptr!(List),
+            ValueKind::Attrset => unpack_ptr!(Attrset),
+            ValueKind::Function => unpack_ptr!(Function),
+            // FIXME: this pointer may not be in x86_64 canonical form
+            ValueKind::Lazy => unsafe {
+                UnpackedValue::Lazy(LazyValue({
+                    let raw = (self.0 & !ATTRSET_TAG_MASK) as *const _;
+                    Rc::increment_strong_count(raw);
+                    Rc::from_raw(raw)
+                }))
+            },
+            ValueKind::Null => UnpackedValue::Null,
+        }
+    }
+
+    fn into_unpacked(self) -> UnpackedValue {
+        macro_rules! unpack_ptr {
+            ($kind: ident) => {
+                UnpackedValue::$kind(unsafe { Rc::from_raw((self.0 & !VALUE_TAG_MASK) as *mut _) })
             };
         }
         match self.kind() {
@@ -1846,6 +1823,17 @@ impl Value {
         } else {
             self
         }
+    }
+
+    fn evaluate_mut(&mut self) -> &Value {
+        if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
+            unsafe {
+                LazyValue(Rc::from_raw((self.0 & !ATTRSET_TAG_MASK) as *mut _))
+                    .evaluate()
+                    .clone_into(self)
+            }
+        }
+        self
     }
 
     fn into_evaluated(self) -> Value {
@@ -1888,17 +1876,13 @@ impl Value {
             (UnpackedValue::Integer(a), UnpackedValue::Integer(b)) => {
                 UnpackedValue::Integer(a + b).pack()
             }
-            (UnpackedValue::String(a), UnpackedValue::String(b)) => unsafe {
-                UnpackedValue::new_string({
-                    let a = &(*a).value;
-                    let b = &(*b).value;
-                    let mut result = String::with_capacity(a.len() + b.len());
-                    result += a;
-                    result += b;
-                    result
-                })
-                .pack()
-            },
+            (UnpackedValue::String(a), UnpackedValue::String(b)) => UnpackedValue::new_string({
+                let mut result = String::with_capacity(a.len() + b.len());
+                result += &a;
+                result += &b;
+                result
+            })
+            .pack(),
             (a, b) => todo!("{a:?} + {b:?}"),
         }
     }
@@ -1980,20 +1964,19 @@ impl Value {
 
 impl Clone for Value {
     fn clone(&self) -> Self {
-        // TODO: refcnt
-        Self(self.0)
+        self.unpack().pack()
     }
 }
 
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.clone().unpack().fmt_display_rec(0, f)
+        self.unpack().fmt_display_rec(0, f)
     }
 }
 
 impl Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.clone().unpack())
+        write!(f, "{:?}", self.unpack())
     }
 }
 
@@ -2001,13 +1984,10 @@ fn create_root_scope() -> *mut Scope {
     let mut values = ValueMap::new();
 
     macro_rules! extract_typed {
-        ($builtin_name: literal, $what: ident($value: expr)) => {
-            unsafe {&***extract_typed!($builtin_name, HeapValue<$what>($value))}
-        };
         // TODO: unpack_ref
-        ($builtin_name: literal, HeapValue<$what: ident>($value: expr)) => {
-            match &$value.clone().unpack() {
-                UnpackedValue::$what(ptr) => &(*ptr),
+        ($builtin_name: literal, $what: ident($value: expr)) => {
+            match $value.unpack() {
+                UnpackedValue::$what(ptr) => ptr,
                 other => panic!(
                     concat!("builtin ", $builtin_name, " expected {} but got {}"),
                     ValueKind::$what,
@@ -2028,15 +2008,17 @@ fn create_root_scope() -> *mut Scope {
                     let mapper = extract_typed!("map", Function(fun));
                     UnpackedValue::new_function(move |list| {
                         let list = extract_typed!("map", List(list));
-                        UnpackedValue::List(HeapValue::new(
-                            list.iter()
+                        UnpackedValue::new_list(
+                            unsafe { &*list.get() }
+                                .iter()
                                 .map(|x| {
+                                    let mapper = mapper.clone();
                                     let fun = fun.clone();
                                     x.clone()
                                         .lazy_map(move |x| unsafe { (mapper.call)(fun, x) })
                                 })
                                 .collect(),
-                        ))
+                        )
                         .pack()
                     })
                     .pack()
@@ -2064,7 +2046,7 @@ fn create_root_scope() -> *mut Scope {
         "import".to_string(),
         UnpackedValue::new_function(|value| {
             let path = extract_typed!("import", Path(value));
-            import(path)
+            import(&path)
         })
         .pack(),
     );
@@ -2102,11 +2084,11 @@ fn import(path: &Path) -> Value {
 }
 
 fn seq(value: &Value, deep: bool) {
-    match value.clone().unpack() {
+    match value.unpack() {
         UnpackedValue::Integer(_) => (),
         UnpackedValue::Bool(_) => (),
         UnpackedValue::List(value) => {
-            let list = unsafe { &mut **value };
+            let list = unsafe { &mut *value.get() };
             for value in list.iter() {
                 let value = value.evaluate();
                 if deep {
@@ -2115,8 +2097,8 @@ fn seq(value: &Value, deep: bool) {
             }
         }
         UnpackedValue::Attrset(value) => {
-            let map = unsafe { &mut **value };
-            for (key, value) in map.iter() {
+            let map = unsafe { &mut *value.get() };
+            for (key, value) in map.iter_mut() {
                 println!("seq: evaluating key {key}");
                 let value = value.evaluate();
                 if deep {
@@ -2133,22 +2115,11 @@ fn seq(value: &Value, deep: bool) {
 }
 
 #[test]
-fn pointer_packing_works() {
-    let fake_ptr = 0b10101000 as *mut HeapValue<ValueMap>;
-    assert!(matches!(
-        UnpackedValue::Attrset(fake_ptr).pack().unpack(),
-        UnpackedValue::Attrset(ptr) if ptr == fake_ptr
-    ));
-}
-
-#[test]
 fn string_packing_works() {
-    unsafe {
-        assert!(matches!(
-            UnpackedValue::new_string("hello".to_string()).pack().unpack(),
-            UnpackedValue::String(ptr) if (*ptr).value == "hello"
-        ))
-    };
+    assert!(matches!(
+        UnpackedValue::new_string("hello".to_string()).pack().unpack(),
+        UnpackedValue::String(ptr) if *ptr == "hello"
+    ))
 }
 
 #[test]
