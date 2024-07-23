@@ -8,18 +8,19 @@ use core::{arch::asm, panic};
 use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
-    ffi::{CStr, CString},
+    ffi::CStr,
     fmt::{Debug, Display, Write},
-    mem::{offset_of, MaybeUninit},
+    mem::{offset_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
     os::raw::c_void,
     path::{Path, PathBuf},
+    ptr::NonNull,
     rc::Rc,
 };
 
 use iced_x86::code_asm::*;
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
-use rnix::ast::{Attr, Attrpath, Expr, HasEntry, InterpolPart};
+use rnix::ast::{Attr, Attrpath, Expr, HasEntry, InterpolPart, Str};
 
 #[derive(Debug)]
 enum Operation {
@@ -33,6 +34,10 @@ enum Operation {
     HasAttrpath(usize),
     PushList,
     ListAppend(Program),
+    StringCloneToMut,
+    // TODO: Make construction Operations like StringAppend, SetAttrpath, InheritAttrs etc.
+    //       unchecked at runtime (with optional checking for debugging?).
+    StringMutAppend,
     Concat,
     Update,
     Add,
@@ -101,11 +106,41 @@ fn build_attrpath(here: &Path, attrpath: Attrpath, program: &mut Program) -> usi
                     .pack(),
             )),
             Attr::Dynamic(x) => build_program(here, x.expr().unwrap(), program),
-            Attr::Str(_) => todo!(),
+            Attr::Str(x) => build_string(here, x, program),
         };
         n += 1;
     }
     n
+}
+
+fn build_string(here: &Path, str: Str, program: &mut Program) {
+    let parts = str.normalized_parts();
+    if parts.is_empty() {
+        program.operations.push(Operation::Push(
+            UnpackedValue::new_string(String::new()).pack(),
+        ))
+    } else {
+        let mut first = true;
+        for part in parts {
+            match part {
+                InterpolPart::Literal(literal) => program
+                    .operations
+                    .push(Operation::Push(UnpackedValue::new_string(literal).pack())),
+                InterpolPart::Interpolation(interpol) => {
+                    build_program(here, interpol.expr().unwrap(), program);
+                    if first {
+                        // The appended-to string in StringMutAppend is assumed to already be a
+                        // String value, therefore it has to be unlazy-ied in the interpolated case
+                        program.operations.push(Operation::StringCloneToMut)
+                    }
+                }
+            }
+            if !first {
+                program.operations.push(Operation::StringMutAppend)
+            }
+            first = false;
+        }
+    }
 }
 
 fn build_program(here: &Path, expr: Expr, program: &mut Program) {
@@ -116,7 +151,7 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
             program.operations.push(Operation::Apply);
         }
         // TODO:
-        Expr::Assert(_) => (),
+        Expr::Assert(x) => build_program(here, x.body().unwrap(), program),
         Expr::Error(_) => todo!(),
         Expr::IfElse(x) => {
             build_program(here, x.condition().unwrap(), program);
@@ -135,18 +170,7 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
                 program.operations.push(Operation::GetAttrConsume)
             }
         }
-        Expr::Str(x) => {
-            let mut parts = x.normalized_parts();
-            match &mut parts[..] {
-                [InterpolPart::Literal(value)] => program.operations.push(Operation::Push(
-                    UnpackedValue::new_string(std::mem::take(value)).pack(),
-                )),
-                [] => program.operations.push(Operation::Push(
-                    UnpackedValue::new_string(String::new()).pack(),
-                )),
-                other => todo!(),
-            }
-        }
+        Expr::Str(x) => build_string(here, x, program),
         Expr::Path(x) => {
             let mut parts = x.parts().collect::<Vec<_>>();
             match &mut parts[..] {
@@ -256,11 +280,10 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
                 rec: x.rec_token().is_some(),
             });
             for inherit in x.inherits() {
-                let source = if let Some(source) = inherit.from().and_then(|f| f.expr()) {
-                    Some(create_program(here, source))
-                } else {
-                    None
-                };
+                let source = inherit
+                    .from()
+                    .and_then(|f| f.expr())
+                    .map(|source| create_program(here, source));
                 program.operations.push(Operation::InheritAttrs(
                     source,
                     inherit.attrs().map(attr_assert_const).collect(),
@@ -309,6 +332,7 @@ struct Executable {
     //        Do we have reference cycles here?
     _referenced_strings: Vec<String>,
     _referenced_executables: Vec<Rc<Executable>>,
+    _referenced_values: Vec<Value>,
     _parameter: Option<Box<Parameter>>,
     len: usize,
     code: extern "C" fn(Value, Value) -> Value,
@@ -508,6 +532,7 @@ unsafe extern "C" fn map_inherit_from(
                 let UnpackedValue::Attrset(attrs) = value else {
                     panic!("map_inherit_from: not an attrset");
                 };
+                println!("{:?} {key}", &*attrs.get());
                 (*attrs.get()).get(key).unwrap().clone()
             }))
             .pack(),
@@ -641,8 +666,37 @@ unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
     }
 }
 
+unsafe extern "C" fn string_mut_append(from: NonNull<String>, to: &mut String) {
+    assert_ne!(from.as_ptr(), to as *mut _);
+    *dbg!(to) += dbg!(from.as_ref());
+    Rc::decrement_strong_count(from.as_ptr());
+}
+
 unsafe extern "C" fn value_into_evaluated(a: Value) -> Value {
     dbg!(a.into_evaluated())
+}
+
+unsafe extern "C" fn value_ref(a: ManuallyDrop<Value>) -> Value {
+    a.deref().clone()
+}
+
+unsafe extern "C" fn value_string_to_mut(a: Value) -> Value {
+    macro_rules! clonerc {
+        ($x: expr) => {
+            if Rc::strong_count(&$x) > 1 {
+                Rc::new((*$x).clone())
+            } else {
+                $x
+            }
+        };
+    }
+    match a.into_unpacked() {
+        UnpackedValue::String(x) => UnpackedValue::String(clonerc!(x)),
+        UnpackedValue::Path(x) => UnpackedValue::Path(clonerc!(x)),
+        UnpackedValue::Lazy(x) => return value_string_to_mut(x.evaluate().clone()),
+        other => other,
+    }
+    .pack()
 }
 
 unsafe extern "C" fn asm_panic(msg: *const i8) {
@@ -668,6 +722,11 @@ impl Program {
     fn compile(self, param: Option<Parameter>) -> Result<Executable, IcedError> {
         let debug_header = format!("{self:?}");
 
+        let mut referenced_values = vec![];
+        let mut intern_value = |value: Value| unsafe {
+            referenced_values.push(value.leaking_copy());
+            value
+        };
         let mut referenced_executables = vec![];
         let mut intern_executable = |executable: Executable| {
             let rc = Rc::new(executable);
@@ -878,7 +937,8 @@ impl Program {
             for op in self.operations.into_iter() {
                 match op {
                     Operation::Push(value) => {
-                        asm.mov(rax, value.0)?;
+                        asm.mov(rdi, intern_value(value).0)?;
+                        call!(rust value_ref);
                         asm.push(rax)?;
                         stack_values += 1;
                     }
@@ -1289,6 +1349,36 @@ impl Program {
                         asm.set_label(&mut end)?;
                         stack_values += 1;
                     }
+                    Operation::Invert => {
+                        assert!(stack_values >= 1);
+                        asm.pop(rdi)?;
+                        stack_values -= 1;
+
+                        let mut end = asm.create_label();
+                        let mut not_an_integer = asm.create_label();
+
+                        asm.mov(rax, rdi)?;
+                        asm.and(rax, VALUE_TAG_MASK as i32)?;
+                        asm.cmp(rax, ValueKind::Integer as i32)?;
+                        asm.jne(not_an_integer)?;
+
+                        asm.shr(rax, 3)?;
+                        asm.not(rax)?;
+                        asm.shl(rax, 3)?;
+                        asm.or(rax, ValueKind::Integer as i32)?;
+
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_an_integer)?;
+                        asm.mov(
+                            rdi,
+                            c"invert attempted on non-integer value".as_ptr() as u64,
+                        )?;
+                        call!(rust asm_panic);
+
+                        asm.set_label(&mut end)?;
+                        stack_values += 1;
+                    }
                     Operation::Concat => {
                         assert!(stack_values >= 2);
                         asm.pop(rdi)?;
@@ -1329,16 +1419,47 @@ impl Program {
                         asm.set_label(&mut end)?;
                         stack_values += 1;
                     }
-                    x => {
-                        let dbg = CString::new(format!("TODO: Operation::{x:?}"))
-                            .unwrap()
-                            .into_raw();
-                        asm.mov(rdi, dbg as u64)?;
+                    Operation::StringMutAppend => {
+                        assert!(stack_values >= 2);
+                        asm.pop(rdi)?;
+                        stack_values -= 1;
+                        unlazy!(rdi, rcx);
+
+                        let mut end = asm.create_label();
+                        let mut not_a_string = asm.create_label();
+
+                        asm.mov(rcx, rdi)?;
+                        asm.and(rcx, VALUE_TAG_MASK as i32)?;
+                        asm.cmp(rcx, ValueKind::String as i32)?;
+                        asm.jne(not_a_string)?;
+
+                        asm.sub(rdi, ValueKind::String as i32)?;
+                        asm.mov(rsi, qword_ptr(rsp))?;
+                        asm.sub(rsi, ValueKind::String as i32)?;
+
+                        call!(rust string_mut_append);
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_a_string)?;
+                        asm.mov(
+                            rdi,
+                            c"string append attempted with non-string value".as_ptr() as u64,
+                        )?;
                         call!(rust asm_panic);
+
+                        asm.set_label(&mut end)?;
                     }
+                    Operation::StringCloneToMut => {
+                        assert!(stack_values >= 1);
+                        asm.mov(rdi, qword_ptr(rsp))?;
+                        call!(rust value_string_to_mut);
+                        asm.mov(qword_ptr(rsp), rax)?;
+                    }
+                    x => panic!("TODO: Operation::{x:?}"),
                 }
             }
 
+            println!("{debug_header}");
             assert_eq!(stack_values, 1);
             asm.pop(rax)?;
 
@@ -1384,6 +1505,7 @@ impl Program {
                 panic!("mprotect failed");
             }
             Ok(Executable {
+                _referenced_values: referenced_values,
                 _referenced_executables: referenced_executables,
                 _referenced_strings: referenced_strings,
                 _parameter: parameter,
@@ -1855,6 +1977,40 @@ impl Value {
         }
     }
 
+    fn is_heap_allocated(&self) -> bool {
+        match self.kind() {
+            ValueKind::Attrset => true,
+            ValueKind::Function => true,
+            ValueKind::Integer => false,
+            ValueKind::Double => false,
+            ValueKind::String => true,
+            ValueKind::Path => true,
+            ValueKind::List => true,
+            ValueKind::Bool => false,
+            ValueKind::Lazy => true,
+            ValueKind::Null => false,
+        }
+    }
+
+    unsafe fn increase_refcount(&self) {
+        macro_rules! incref {
+            ($x: expr) => {
+                unsafe { Rc::increment_strong_count(Rc::as_ptr($x)) }
+            };
+        }
+        match &self.unpack() {
+            UnpackedValue::Integer(_) => (),
+            UnpackedValue::Bool(_) => (),
+            UnpackedValue::List(x) => incref!(x),
+            UnpackedValue::Attrset(x) => incref!(x),
+            UnpackedValue::String(x) => incref!(x),
+            UnpackedValue::Function(x) => incref!(x),
+            UnpackedValue::Path(x) => incref!(x),
+            UnpackedValue::Lazy(x) => incref!(&x.0),
+            UnpackedValue::Null => (),
+        }
+    }
+
     fn evaluate(&self) -> &Value {
         if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
             unsafe { (*((self.0 & !ATTRSET_TAG_MASK) as *mut LazyValueImpl)).evaluate() }
@@ -2005,7 +2161,10 @@ impl Value {
 
 impl Clone for Value {
     fn clone(&self) -> Self {
-        self.unpack().pack()
+        unsafe {
+            self.increase_refcount();
+        }
+        Value(self.0)
     }
 }
 
@@ -2127,6 +2286,14 @@ fn create_root_scope() -> *mut Scope {
                         Value::FALSE
                     })
                     .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "add".to_string(),
+                UnpackedValue::new_function(|a| {
+                    UnpackedValue::new_function(move |b| a.clone().add(b)).pack()
                 })
                 .pack(),
             );
