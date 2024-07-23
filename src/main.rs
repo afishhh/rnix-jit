@@ -79,6 +79,19 @@ fn attr_assert_const(attr: Attr) -> String {
     }
 }
 
+// TODO: Notes on building attrsets
+// The reference nix implementation allows using attrpaths with the same prefix like this:
+// {
+//     a.a = 1;
+//     a.b = 1;
+// }
+// This is simple when there is no dynamic components on the path.
+// Fortunately, it is forbidden to do the same with dynamic components.
+// This means that the fastest way to compile an attrset build would be to build out a tree
+// structure from the attrpaths and probably compile known attributes statically into a base
+// attribute set which would then be filled with values and possible dynamic attributes.
+// I believe this would improve attrset building performance during runtime pretty significantly
+
 fn build_attrpath(here: &Path, attrpath: Attrpath, program: &mut Program) -> usize {
     let mut n = 0;
     for attr in attrpath.attrs().collect::<Vec<_>>().into_iter().rev() {
