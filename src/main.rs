@@ -25,7 +25,7 @@ use rnix::ast::{Attr, Attrpath, Expr, HasEntry, InterpolPart};
 enum Operation {
     Push(Value),
     // This is different from Push because this also sets the parent scope of the function
-    PushFunction(Executable),
+    PushFunction(Parameter, Program),
     CreateAttrset { rec: bool },
     InheritAttrs(bool, Vec<String>),
     SetAttrpath(usize, Program),
@@ -178,10 +178,9 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
                 }
             };
             let body = x.body().unwrap();
-            let mut function_executable = Program::new();
-            build_program(here, body, &mut function_executable);
-            let compiled = function_executable.compile(Some(param)).unwrap();
-            program.operations.push(Operation::PushFunction(compiled))
+            program
+                .operations
+                .push(Operation::PushFunction(param, create_program(here, body)))
         }
         Expr::LegacyLet(_) => todo!(),
         Expr::LetIn(x) => {
@@ -363,7 +362,10 @@ impl Scope {
 
     unsafe fn lookup(mut scope: *mut Scope, name: &str) -> Value {
         loop {
-            match dbg!((*dbg!(scope)).get(dbg!(name))) {
+            let mut scope_debug = String::new();
+            UnpackedValue::fmt_attrset_display(&*(*scope).values, 0, &mut scope_debug, true).unwrap();
+            eprintln!("{scope:?} {name} {}", scope_debug);
+            match (*scope).get(name) {
                 Some(value) => return value.clone(),
                 None => {
                     scope = (*scope).previous;
@@ -608,7 +610,7 @@ unsafe extern "C" fn create_function_value(
     Rc::increment_strong_count(executable);
     UnpackedValue::Function(Rc::new(Function {
         call: (*executable).code,
-        executable: Some(Rc::from_raw(executable)),
+        _executable: Some(Rc::from_raw(executable)),
         builtin_closure: None,
         parent_scope: scope,
     }))
@@ -713,13 +715,13 @@ impl Program {
 
             macro_rules! call {
                 (reg $reg: ident) => {
-                    if stack_values % 2 != 0 {
+                    if stack_values % 2 != (parameter.is_some() as usize) {
                         asm.sub(rsp, 8)?;
                     }
 
                     asm.call($reg)?;
 
-                    if stack_values % 2 != 0 {
+                    if stack_values % 2 != (parameter.is_some() as usize) {
                         asm.add(rsp, 8)?;
                     }
                 };
@@ -742,6 +744,7 @@ impl Program {
                 )?;
                 asm.mov(rdx, param as u64)?;
 
+                asm.push(r15)?;
                 call!(rust scope_function_scope);
                 asm.mov(r15, rax)?;
             }
@@ -885,8 +888,8 @@ impl Program {
                         asm.push(rax)?;
                         stack_values += 1;
                     }
-                    Operation::PushFunction(exec) => {
-                        let raw = intern_executable(exec);
+                    Operation::PushFunction(param, program) => {
+                        let raw = intern_executable(program.compile(Some(param))?);
                         asm.mov(rdi, raw as u64)?;
                         asm.mov(rsi, r15)?;
                         call!(rust create_function_value);
@@ -1357,8 +1360,10 @@ impl Program {
             assert_eq!(stack_values, 1);
             asm.pop(rax)?;
 
+            if parameter.is_some() {
+                asm.pop(r15)?;
+            }
             // callee saved registers
-            // asm.pop(r15)?;
             asm.pop(r14)?;
             asm.pop(r13)?;
             asm.pop(r12)?;
@@ -1370,14 +1375,14 @@ impl Program {
             asm.assemble(0)?
         };
 
-        println!("{}", debug_header);
+        eprintln!("{}", debug_header);
         let decoder = iced_x86::Decoder::new(64, &code, 0);
         let mut formatter = iced_x86::IntelFormatter::new();
         let mut output = String::new();
         for instruction in decoder {
             output.clear();
             iced_x86::Formatter::format(&mut formatter, &instruction, &mut output);
-            println!("\t{output}")
+            eprintln!("\t{output}")
         }
 
         unsafe {
@@ -1431,14 +1436,16 @@ enum ValueKind {
     List,
     Bool,
     // NOTE: These are no longer tag values, instead these are packed into Attrset tags
+    // FIXME: Most Values in the whole program are going to be hidden behind this extra layer of
+    //        LazyValue indirection, maybe there is a way to make the potential performance penalty
+    //        smaller?
     Lazy, // a pointer to LazyValue
     Null, // all zeroes: an attrset which is a null pointer
 }
 
-#[repr(C)]
 struct Function {
     call: unsafe extern "C" fn(Value, Value) -> Value,
-    executable: Option<Rc<Executable>>,
+    _executable: Option<Rc<Executable>>,
     builtin_closure: Option<Box<dyn FnMut(Value) -> Value>>,
     parent_scope: *const Scope,
 }
@@ -1465,15 +1472,15 @@ impl LazyValueImpl {
                 LAZY_DEPTH.with(|x| unsafe {
                     let depth = &mut *x.get();
                     *depth += 1;
-                    if *depth > 20 {
+                    if *depth > 1000 {
                         panic!("max lazy JIT depth exceeded");
                     };
                 });
-                println!("evaluating lazy JIT executable");
+                eprintln!("evaluating lazy JIT executable");
                 let result = (**executable).run(*scope, &Value::NULL).into_evaluated();
                 unsafe { Rc::decrement_strong_count(executable) };
                 *self = LazyValueImpl::Evaluated(result);
-                println!("evaluated lazy JIT executable");
+                eprintln!("evaluated lazy JIT executable");
                 LAZY_DEPTH.with(|x| unsafe {
                     let depth = &mut *x.get();
                     *depth -= 1;
@@ -1565,10 +1572,10 @@ impl Display for ValueKind {
 
 unsafe extern "C" fn call_builtin(fun: Value, value: Value) -> Value {
     let this = (fun.0 & !VALUE_TAG_MASK) as *mut Function;
-    // println!(
-    //     "call_builtin HeapValue:{:?} arg:{value:?}",
-    //     this as *const _
-    // );
+    eprintln!(
+        "call_builtin HeapValue:{:?} arg:{value:?}",
+        this as *const _
+    );
     ((*this).builtin_closure.as_mut().unwrap_unchecked())(value)
 }
 
@@ -1592,7 +1599,7 @@ impl UnpackedValue {
     fn new_function(function: impl FnMut(Value) -> Value + 'static) -> UnpackedValue {
         UnpackedValue::Function(Rc::new(Function {
             call: call_builtin,
-            executable: None,
+            _executable: None,
             builtin_closure: Some(Box::new(function)),
             parent_scope: std::ptr::null_mut(),
         }))
@@ -1731,7 +1738,7 @@ impl UnpackedValue {
             Self::Attrset(value) => {
                 Self::fmt_attrset_display(unsafe { &*(value.get()) }, depth, f, false)
             }
-            Self::Function(_) => write!(f, "<function>"),
+            Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
                     x.clone().unpack().fmt_display_rec(depth, f)
@@ -1761,7 +1768,7 @@ impl UnpackedValue {
             Self::Attrset(value) => {
                 Self::fmt_attrset_display(unsafe { &*(value.get()) }, depth, f, true)
             }
-            Self::Function(_) => write!(f, "<function>"),
+            Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
                     x.unpack().fmt_display_rec(depth, f)
@@ -2075,10 +2082,55 @@ fn create_root_scope() -> *mut Scope {
                 .pack(),
             );
 
+            macro_rules! insert_is_builtin {
+                ($name: literal, $type: ident) => {
+                    builtins.insert(
+                        $name.to_string(),
+                        UnpackedValue::new_function(|value| {
+                            UnpackedValue::Bool(match value.into_evaluated().unpack() {
+                                UnpackedValue::$type(..) => true,
+                                UnpackedValue::Lazy(_) => unreachable!(),
+                                _ => false,
+                            })
+                            .pack()
+                        })
+                        .pack(),
+                    );
+                };
+            }
+
+            insert_is_builtin!("isPath", Path);
+
+            builtins.insert(
+                "seq".to_string(),
+                UnpackedValue::new_function(|seqd| {
+                    seq(&seqd, false);
+                    UnpackedValue::new_function(|value| value).pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "deepSeq".to_string(),
+                UnpackedValue::new_function(|seqd| {
+                    seq(&seqd, true);
+                    UnpackedValue::new_function(|value| value).pack()
+                })
+                .pack(),
+            );
+
             builtins.insert(
                 "trace".to_string(),
                 UnpackedValue::new_function(|message| {
                     println!("trace: {message}");
+                    UnpackedValue::new_function(|value| value).pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "addErrorContext".to_string(),
+                UnpackedValue::new_function(|_context| {
                     UnpackedValue::new_function(|value| value).pack()
                 })
                 .pack(),
@@ -2148,7 +2200,7 @@ fn seq(value: &Value, deep: bool) {
         UnpackedValue::Attrset(value) => {
             let map = unsafe { &mut *value.get() };
             for (key, value) in map.iter_mut() {
-                println!("seq: evaluating key {key}");
+                eprintln!("seq: evaluating key {key}");
                 let value = value.evaluate();
                 if deep {
                     seq(value, deep);
