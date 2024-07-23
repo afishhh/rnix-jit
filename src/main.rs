@@ -604,11 +604,27 @@ unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Val
         .clone()
 }
 
-unsafe extern "C" fn attrset_hasattr(map: &ValueMap, name: Value) -> Value {
-    let UnpackedValue::String(name) = name.unpack() else {
-        panic!("HasAttr called with non-string name")
-    };
-    UnpackedValue::Bool(map.get(name.as_str()).is_some()).pack()
+unsafe fn attrset_hasattrpath_impl(map: &ValueMap, names: &[&String]) -> Value {
+    eprintln!("{map:?} {names:?}");
+    let (current, rest) = names.split_last().unwrap();
+    match (
+        map.get(*current).map(Value::evaluate).map(Value::unpack),
+        rest,
+    ) {
+        (Some(_), []) => Value::TRUE,
+        (Some(UnpackedValue::Attrset(next)), rest) => attrset_hasattrpath_impl(&*next.get(), rest),
+        (_, _) => Value::FALSE,
+    }
+}
+
+unsafe extern "C" fn attrset_hasattrpath(
+    map: &ValueMap,
+    names: *const &String,
+    names_len: usize,
+) -> Value {
+    let names = std::slice::from_raw_parts(names, names_len);
+    eprintln!("{map:?} {names:?}");
+    attrset_hasattrpath_impl(map, names)
 }
 
 unsafe extern "C" fn attrset_update(left: &ValueMap, right: &ValueMap) -> Value {
@@ -1137,32 +1153,49 @@ impl Program {
                         stack_values += 1;
                     }
                     Operation::HasAttrpath(len) => {
-                        assert!(stack_values >= 2);
-                        assert!(len == 1);
-                        asm.pop(rsi)?;
-                        stack_values -= 1;
-                        unlazy!(rsi, rdi);
-                        asm.pop(rdi)?;
-                        stack_values -= 1;
-                        unlazy!(rdi, rcx);
+                        assert!(stack_values > len);
+                        asm.mov(r12, qword_ptr(rsp + 8 * len))?;
+                        unlazy!(r12, rdi);
 
                         let mut not_an_attrset = asm.create_label();
-                        asm.mov(rcx, rdi)?;
+                        let mut not_a_string = asm.create_label();
+                        asm.mov(rcx, r12)?;
                         asm.and(rcx, r14)?;
                         asm.cmp(rcx, ValueKind::Attrset as i32)?;
                         asm.jne(not_an_attrset)?;
+                        asm.sub(r12, ValueKind::Attrset as i32)?;
 
-                        asm.sub(rdi, ValueKind::Attrset as i32)?;
+                        for i in 0..len {
+                            asm.mov(rdi, qword_ptr(rsp + 8 * i))?;
+                            unlazy!(rdi, rax);
+                            asm.mov(rcx, rdi)?;
+                            asm.and(rcx, VALUE_TAG_MASK as i32)?;
+                            asm.cmp(rcx, ValueKind::String as i32)?;
+                            asm.jne(not_a_string)?;
+                            asm.sub(rdi, ValueKind::String as i32)?;
+                            asm.mov(qword_ptr(rsp + 8 * i), rdi)?;
+                        }
 
-                        call!(rust attrset_hasattr);
+                        asm.mov(rdi, r12)?;
+                        asm.mov(rsi, rsp)?;
+                        asm.mov(rdx, len as u64)?;
+                        call!(rust attrset_hasattrpath);
+                        stack_values -= len + 1;
+                        asm.add(rsp, (8 * (len + 1)) as i32)?;
                         asm.push(rax)?;
 
                         let mut end = asm.create_label();
                         asm.jmp(end)?;
 
                         asm.set_label(&mut not_an_attrset)?;
-
                         asm.mov(rdi, c"hasattr called on non-attrset value".as_ptr() as u64)?;
+                        call!(rust asm_panic);
+
+                        asm.set_label(&mut not_a_string)?;
+                        asm.mov(
+                            rdi,
+                            c"hasattr called with non-string path component".as_ptr() as u64,
+                        )?;
                         call!(rust asm_panic);
 
                         asm.set_label(&mut end)?;
