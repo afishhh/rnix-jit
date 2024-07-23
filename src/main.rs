@@ -583,11 +583,22 @@ unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Val
         .clone()
 }
 
-unsafe extern "C" fn attrset_hasattr(map: &mut ValueMap, name: Value) -> Value {
+unsafe extern "C" fn attrset_hasattr(map: &ValueMap, name: Value) -> Value {
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("HasAttr called with non-string name")
     };
     UnpackedValue::Bool(map.get(name.as_str()).is_some()).pack()
+}
+
+unsafe extern "C" fn attrset_update(left: &ValueMap, right: &ValueMap) -> Value {
+    UnpackedValue::new_attrset({
+        let mut result = left.clone();
+        for (key, value) in right.iter() {
+            result.insert(key.to_string(), value.clone());
+        }
+        result
+    })
+    .pack()
 }
 
 unsafe extern "C" fn create_function_value(
@@ -857,6 +868,15 @@ impl Program {
             //             asm.jne($else)?;
             //     }
             // }
+            macro_rules! unpack {
+                (Attrset $reg: ident tmp = $tmp: ident else => $else: ident) => {{
+                    asm.mov($tmp, $reg)?;
+                    asm.and($tmp, r14)?;
+                    asm.cmp($tmp, ValueKind::Attrset as i32)?;
+                    asm.jne($else)?;
+                    asm.sub($reg, ValueKind::Attrset as i32)?;
+                }};
+            }
 
             for op in self.operations.into_iter() {
                 match op {
@@ -1293,6 +1313,35 @@ impl Program {
                         call!(rust list_concat);
 
                         asm.push(rax)?;
+                        stack_values += 1;
+                    }
+                    Operation::Update => {
+                        assert!(stack_values >= 2);
+                        asm.pop(r12)?;
+                        stack_values -= 1;
+                        unlazy!(r12, rdi);
+                        asm.pop(rdi)?;
+                        stack_values -= 1;
+                        unlazy!(rdi, rcx);
+                        asm.mov(rsi, r12)?;
+
+                        let mut end = asm.create_label();
+                        let mut not_an_attrset = asm.create_label();
+                        unpack!(Attrset rdi tmp = rcx else => not_an_attrset);
+                        unpack!(Attrset rsi tmp = rcx else => not_an_attrset);
+                        call!(rust attrset_update);
+                        asm.push(rax)?;
+
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_an_attrset)?;
+                        asm.mov(
+                            rdi,
+                            c"update attempted on non-attrset values".as_ptr() as u64,
+                        )?;
+                        call!(rust asm_panic);
+
+                        asm.set_label(&mut end)?;
                         stack_values += 1;
                     }
                     x => {
