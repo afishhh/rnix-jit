@@ -309,15 +309,9 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
         Expr::With(_) => todo!(),
         Expr::HasAttr(x) => {
             build_program(here, x.expr().unwrap(), program);
-            let mut parts = 0;
-            for attr in x.attrpath().unwrap().attrs() {
-                let name = attr_assert_const(attr);
-                program
-                    .operations
-                    .push(Operation::Push(UnpackedValue::new_string(name).pack()));
-                parts += 1;
-            }
-            program.operations.push(Operation::HasAttrpath(parts))
+            let attrpath = x.attrpath().unwrap();
+            let n = build_attrpath(here, attrpath, program);
+            program.operations.push(Operation::HasAttrpath(n))
         }
         _ => todo!(),
     }
