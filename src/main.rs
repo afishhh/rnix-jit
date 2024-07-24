@@ -995,6 +995,14 @@ impl Program {
                         bool => asm.or(rdi, rsi)?,
                         fallback = Value::or
                     ),
+                    Operation::Implication => impl_binary_operator!(
+                        bool => {
+                            asm.cmp(rdi, Value::TRUE.0 as i32)?;
+                            asm.mov(rdi, Value::TRUE.0)?;
+                            asm.cmove(rdi, rsi)?;
+                        },
+                        fallback = Value::implication
+                    ),
                     Operation::Less => impl_binary_operator!(
                         comparison cmovl or Value::less
                     ),
@@ -2157,6 +2165,18 @@ impl Value {
             (UnpackedValue::Bool(a), UnpackedValue::Bool(b)) => UnpackedValue::Bool(a || b).pack(),
             (a, b) => panic!(
                 "|| is not supported between values of type {} and {}",
+                a.kind(),
+                b.kind()
+            ),
+        }
+    }
+    extern "C" fn implication(self, other: Value) -> Value {
+        match (self.unpack(), other.unpack()) {
+            (UnpackedValue::Bool(a), UnpackedValue::Bool(b)) => {
+                UnpackedValue::Bool(if a { b } else { true }).pack()
+            }
+            (a, b) => panic!(
+                "-> is not supported between values of type {} and {}",
                 a.kind(),
                 b.kind()
             ),
