@@ -7,9 +7,11 @@
 use core::{arch::asm, panic};
 use std::{
     cell::UnsafeCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
+    env::VarError,
     ffi::CStr,
     fmt::{Debug, Display, Write},
+    fs::FileType,
     mem::{offset_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
     os::raw::c_void,
@@ -20,6 +22,7 @@ use std::{
 
 use iced_x86::code_asm::*;
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use regex::Regex;
 use rnix::ast::{Attr, Attrpath, Expr, HasEntry, InterpolPart, Str};
 
 #[derive(Debug)]
@@ -187,7 +190,7 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
             rnix::ast::LiteralKind::Float(_) => todo!(),
             rnix::ast::LiteralKind::Integer(x) => {
                 program.operations.push(Operation::Push(
-                    UnpackedValue::Integer(x.value().unwrap()).pack(),
+                    UnpackedValue::Integer(x.value().unwrap() as i32).pack(),
                 ));
             }
             rnix::ast::LiteralKind::Uri(_) => todo!(),
@@ -393,7 +396,7 @@ impl Scope {
             let mut scope_debug = String::new();
             UnpackedValue::fmt_attrset_display(&*(*scope).values, 0, &mut scope_debug, true)
                 .unwrap();
-            eprintln!("{scope:?} {name} {}", scope_debug);
+            // eprintln!("{scope:?} {name} {}", scope_debug);
             match (*scope).get(name) {
                 Some(value) => return value.clone(),
                 None => {
@@ -526,8 +529,10 @@ unsafe extern "C" fn map_inherit_from(
                 let UnpackedValue::Attrset(attrs) = value else {
                     panic!("map_inherit_from: not an attrset");
                 };
-                println!("{:?} {key}", &*attrs.get());
-                (*attrs.get()).get(key).unwrap().clone()
+                (*attrs.get())
+                    .get(key)
+                    .unwrap_or_else(|| panic!("inherit({:?}) {:?} missing", (*attrs.get()), key))
+                    .clone()
             }))
             .pack(),
         );
@@ -586,7 +591,9 @@ unsafe extern "C" fn attrset_get(map: &mut ValueMap, name: Value) -> Value {
     let UnpackedValue::String(name) = name.into_unpacked() else {
         panic!("GetAttr called with non-string name")
     };
-    map.get(name.as_str()).unwrap().clone()
+    map.get(name.as_str())
+        .unwrap_or_else(|| panic!("{map:?}.{name:?} doesn't exist"))
+        .clone()
 }
 
 unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Value) -> Value {
@@ -599,7 +606,6 @@ unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Val
 }
 
 unsafe fn attrset_hasattrpath_impl(map: &ValueMap, names: &[&String]) -> Value {
-    eprintln!("{map:?} {names:?}");
     let (current, rest) = names.split_last().unwrap();
     match (
         map.get(*current).map(Value::evaluate).map(Value::unpack),
@@ -617,7 +623,6 @@ unsafe extern "C" fn attrset_hasattrpath(
     names_len: usize,
 ) -> Value {
     let names = std::slice::from_raw_parts(names, names_len);
-    eprintln!("{map:?} {names:?}");
     attrset_hasattrpath_impl(map, names)
 }
 
@@ -678,12 +683,12 @@ unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
 
 unsafe extern "C" fn string_mut_append(from: NonNull<String>, to: &mut String) {
     assert_ne!(from.as_ptr(), to as *mut _);
-    *dbg!(to) += dbg!(from.as_ref());
+    *to += from.as_ref();
     Rc::decrement_strong_count(from.as_ptr());
 }
 
 unsafe extern "C" fn value_into_evaluated(a: Value) -> Value {
-    dbg!(a.into_evaluated())
+    a.into_evaluated()
 }
 
 unsafe extern "C" fn value_ref(a: ManuallyDrop<Value>) -> Value {
@@ -961,22 +966,22 @@ impl Program {
                         stack_values += 1;
                     }
                     Operation::Add => impl_binary_operator!(
-                        int => retag(Integer) { asm.add(rdi, rsi)?; rdi },
+                        int => retag(Integer) { asm.add(edi, esi)?; rdi },
                         fallback = Value::add
                     ),
                     Operation::Sub => impl_binary_operator!(
-                        int => retag(Integer) { asm.sub(rdi, rsi)?; rdi },
+                        int => retag(Integer) { asm.sub(edi, esi)?; rdi },
                         fallback = Value::sub
                     ),
                     Operation::Mul => impl_binary_operator!(
-                        int => retag(Integer) { asm.imul_2(rdi, rsi)?; rdi },
+                        int => retag(Integer) { asm.imul_2(edi, esi)?; rdi },
                         fallback = Value::mul
                     ),
                     Operation::Div => impl_binary_operator!(
                         int => retag(Integer) {
-                            asm.xor(rdx, rdx)?;
-                            asm.mov(rax, rdi)?;
-                            asm.idiv(rsi)?;
+                            asm.xor(edx, edx)?;
+                            asm.mov(eax, edi)?;
+                            asm.idiv(esi)?;
                             rax
                         },
                         fallback = Value::div
@@ -1358,6 +1363,7 @@ impl Program {
                         assert!(stack_values >= 1);
                         asm.pop(rdi)?;
                         stack_values -= 1;
+                        unlazy!(rdi, rcx);
 
                         let mut end = asm.create_label();
                         let mut not_an_integer = asm.create_label();
@@ -1367,11 +1373,12 @@ impl Program {
                         asm.cmp(rax, ValueKind::Integer as i32)?;
                         asm.jne(not_an_integer)?;
 
-                        asm.shr(rax, 3)?;
-                        asm.neg(rax)?;
-                        asm.shl(rax, 3)?;
-                        asm.or(rax, ValueKind::Integer as i32)?;
+                        asm.shr(rdi, 3)?;
+                        asm.neg(edi)?;
+                        asm.shl(rdi, 3)?;
+                        asm.or(rdi, ValueKind::Integer as i32)?;
 
+                        asm.push(rdi)?;
                         asm.jmp(end)?;
 
                         asm.set_label(&mut not_an_integer)?;
@@ -1391,6 +1398,7 @@ impl Program {
 
                         let mut end = asm.create_label();
                         let mut not_an_integer = asm.create_label();
+                        let mut not_a_boolean = asm.create_label();
 
                         asm.mov(rax, rdi)?;
                         asm.and(rax, VALUE_TAG_MASK as i32)?;
@@ -1402,9 +1410,19 @@ impl Program {
                         asm.shl(rax, 3)?;
                         asm.or(rax, ValueKind::Integer as i32)?;
 
+                        asm.push(rax)?;
                         asm.jmp(end)?;
 
                         asm.set_label(&mut not_an_integer)?;
+
+                        asm.cmp(rax, ValueKind::Bool as i32)?;
+                        asm.jne(not_a_boolean)?;
+
+                        asm.xor(rdi, 0b1000)?;
+                        asm.push(rdi)?;
+                        asm.jmp(end)?;
+
+                        asm.set_label(&mut not_a_boolean)?;
                         asm.mov(
                             rdi,
                             c"invert attempted on non-integer value".as_ptr() as u64,
@@ -1494,7 +1512,6 @@ impl Program {
                 }
             }
 
-            println!("{debug_header}");
             assert_eq!(stack_values, 1);
             asm.pop(rax)?;
 
@@ -1513,15 +1530,15 @@ impl Program {
             asm.assemble(0)?
         };
 
-        eprintln!("{}", debug_header);
-        let decoder = iced_x86::Decoder::new(64, &code, 0);
-        let mut formatter = iced_x86::IntelFormatter::new();
-        let mut output = String::new();
-        for instruction in decoder {
-            output.clear();
-            iced_x86::Formatter::format(&mut formatter, &instruction, &mut output);
-            eprintln!("\t{output}")
-        }
+        // eprintln!("{}", debug_header);
+        // let decoder = iced_x86::Decoder::new(64, &code, 0);
+        // let mut formatter = iced_x86::IntelFormatter::new();
+        // let mut output = String::new();
+        // for instruction in decoder {
+        //     output.clear();
+        //     iced_x86::Formatter::format(&mut formatter, &instruction, &mut output);
+        //     eprintln!("\t{output}")
+        // }
 
         unsafe {
             let code_mem = nix::libc::mmap(
@@ -1615,11 +1632,11 @@ impl LazyValueImpl {
                         panic!("max lazy JIT depth exceeded");
                     };
                 });
-                eprintln!("evaluating lazy JIT executable");
+                // eprintln!("evaluating lazy JIT executable");
                 let result = (**executable).run(*scope, &Value::NULL).into_evaluated();
                 unsafe { Rc::decrement_strong_count(executable) };
                 *self = LazyValueImpl::Evaluated(result);
-                eprintln!("evaluated lazy JIT executable");
+                // eprintln!("evaluated lazy JIT executable");
                 LAZY_DEPTH.with(|x| unsafe {
                     let depth = &mut *x.get();
                     *depth -= 1;
@@ -1681,7 +1698,7 @@ impl LazyValue {
 
 #[derive(Clone)]
 enum UnpackedValue {
-    Integer(i64),
+    Integer(i32),
     Bool(bool),
     List(Rc<UnsafeCell<ValueList>>),
     Attrset(Rc<UnsafeCell<ValueMap>>),
@@ -1709,12 +1726,36 @@ impl Display for ValueKind {
     }
 }
 
+impl From<i32> for UnpackedValue {
+    fn from(value: i32) -> Self {
+        UnpackedValue::Integer(value)
+    }
+}
+
+impl From<bool> for UnpackedValue {
+    fn from(value: bool) -> Self {
+        UnpackedValue::Bool(value)
+    }
+}
+
+impl From<String> for UnpackedValue {
+    fn from(value: String) -> Self {
+        UnpackedValue::new_string(value)
+    }
+}
+
+impl<T: Into<UnpackedValue>> From<T> for Value {
+    fn from(value: T) -> Self {
+        value.into().pack()
+    }
+}
+
 unsafe extern "C" fn call_builtin(fun: Value, value: Value) -> Value {
     let this = (fun.0 & !VALUE_TAG_MASK) as *mut Function;
-    eprintln!(
-        "call_builtin HeapValue:{:?} arg:{value:?}",
-        this as *const _
-    );
+    // eprintln!(
+    //     "call_builtin HeapValue:{:?} arg:{value:?}",
+    //     this as *const _
+    // );
     ((*this).builtin_closure.as_mut().unwrap_unchecked())(value)
 }
 
@@ -1767,7 +1808,7 @@ impl UnpackedValue {
         match self {
             Self::Integer(x) => unsafe {
                 Value(
-                    (std::mem::transmute::<i64, u64>(x) << VALUE_TAG_WIDTH)
+                    ((std::mem::transmute::<i32, u32>(x) as u64) << VALUE_TAG_WIDTH)
                         | (ValueKind::Integer as u64),
                 )
             },
@@ -1963,9 +2004,9 @@ impl Value {
             };
         }
         match self.kind() {
-            ValueKind::Integer => {
-                UnpackedValue::Integer(unsafe { std::mem::transmute(self.0 >> VALUE_TAG_WIDTH) })
-            }
+            ValueKind::Integer => UnpackedValue::Integer(unsafe {
+                std::mem::transmute((self.0 >> VALUE_TAG_WIDTH) as u32)
+            }),
             ValueKind::Double => todo!(),
             ValueKind::Bool => UnpackedValue::Bool(self.0 == 0b1000 | (ValueKind::Bool as u64)),
             ValueKind::String => unpack_ptr!(String),
@@ -1992,9 +2033,9 @@ impl Value {
             };
         }
         match self.kind() {
-            ValueKind::Integer => {
-                UnpackedValue::Integer(unsafe { std::mem::transmute(self.0 >> VALUE_TAG_WIDTH) })
-            }
+            ValueKind::Integer => UnpackedValue::Integer(unsafe {
+                std::mem::transmute((self.0 >> VALUE_TAG_WIDTH) as u32)
+            }),
             ValueKind::Double => todo!(),
             ValueKind::Bool => UnpackedValue::Bool(self.0 == 0b1000 | (ValueKind::Bool as u64)),
             ValueKind::String => unpack_ptr!(String),
@@ -2231,9 +2272,17 @@ fn create_root_scope() -> *mut Scope {
     let mut values = ValueMap::new();
 
     macro_rules! extract_typed {
-        // TODO: unpack_ref
+        ($builtin_name: literal, Attrset($value: expr)) => {
+            unsafe { &*extract_typed!(@impl $builtin_name, Attrset($value)).get() }
+        };
+        ($builtin_name: literal, List($value: expr)) => {
+            unsafe { &*extract_typed!(@impl $builtin_name, List($value)).get() }
+        };
         ($builtin_name: literal, $what: ident($value: expr)) => {
-            match $value.unpack() {
+            extract_typed!(@impl $builtin_name, $what($value))
+        };
+        (@impl $builtin_name: literal, $what: ident($value: expr)) => {
+            match $value.evaluate().unpack() {
                 UnpackedValue::$what(ptr) => ptr,
                 other => panic!(
                     concat!("builtin ", $builtin_name, " expected {} but got {}"),
@@ -2244,26 +2293,77 @@ fn create_root_scope() -> *mut Scope {
         };
     }
 
+    macro_rules! call_value {
+        ($builtin_name: literal, $value: expr $(, $args: expr)+) => {{
+            let mut current = $value;
+            $(
+                let fun = extract_typed!($builtin_name, Function(current));
+                current = unsafe { (fun.call)(current, $args) };
+            )+
+            current
+        }};
+    }
+
+    let map_function = UnpackedValue::new_function(|fun| {
+        let mapper = extract_typed!("map", Function(fun));
+        UnpackedValue::new_function(move |list| {
+            let list = extract_typed!("map", List(list));
+            UnpackedValue::new_list(
+                list.iter()
+                    .map(|x| {
+                        let mapper = mapper.clone();
+                        let fun = fun.clone();
+                        x.clone()
+                            .lazy_map(move |x| unsafe { (mapper.call)(fun, x) })
+                    })
+                    .collect(),
+            )
+            .pack()
+        })
+        .pack()
+    })
+    .pack();
+
+    let to_string_function = UnpackedValue::new_function(|value| match value.evaluate().unpack() {
+        UnpackedValue::Integer(_) => todo!(),
+        UnpackedValue::Bool(v) => if v { "1" } else { "0" }.to_string().into(),
+        UnpackedValue::List(_) => todo!(),
+        UnpackedValue::Attrset(_) => todo!(),
+        UnpackedValue::String(_) => value,
+        UnpackedValue::Function(_) => todo!(),
+        UnpackedValue::Path(p) => p.display().to_string().into(),
+        UnpackedValue::Lazy(_) => unreachable!(),
+        UnpackedValue::Null => String::new().into(),
+    })
+    .pack();
+
+    // TODO: Why is this also in the top-level scope? Backwards compatibility?
+    values.insert("map".to_string(), map_function.clone());
+    values.insert("toString".to_string(), to_string_function.clone());
+
     values.insert(
         "builtins".to_string(),
         UnpackedValue::new_attrset({
             let mut builtins = ValueMap::new();
 
+            builtins.insert("map".to_string(), map_function);
+
+            builtins.insert("toString".to_string(), to_string_function);
+
             builtins.insert(
-                "map".to_string(),
-                UnpackedValue::new_function(|fun| {
-                    let mapper = extract_typed!("map", Function(fun));
+                "filter".to_string(),
+                UnpackedValue::new_function(|filter| {
                     UnpackedValue::new_function(move |list| {
-                        let list = extract_typed!("map", List(list));
                         UnpackedValue::new_list(
-                            unsafe { &*list.get() }
+                            extract_typed!("filter", List(list))
                                 .iter()
-                                .map(|x| {
-                                    let mapper = mapper.clone();
-                                    let fun = fun.clone();
-                                    x.clone()
-                                        .lazy_map(move |x| unsafe { (mapper.call)(fun, x) })
+                                .filter(|x| {
+                                    extract_typed!(
+                                        "filter",
+                                        Bool(call_value!("filter", filter.clone(), (*x).clone()))
+                                    )
                                 })
+                                .cloned()
                                 .collect(),
                         )
                         .pack()
@@ -2291,6 +2391,15 @@ fn create_root_scope() -> *mut Scope {
             }
 
             insert_is_builtin!("isPath", Path);
+            insert_is_builtin!("isString", String);
+            insert_is_builtin!("isInt", Integer);
+            builtins.insert(
+                "isFloat".to_string(),
+                UnpackedValue::new_function(|_v| UnpackedValue::Bool(false).pack()).pack(),
+            );
+            insert_is_builtin!("isBool", Bool);
+            insert_is_builtin!("isAttrs", Attrset);
+            insert_is_builtin!("isList", List);
 
             builtins.insert(
                 "seq".to_string(),
@@ -2324,9 +2433,9 @@ fn create_root_scope() -> *mut Scope {
                 UnpackedValue::new_function(|needle| {
                     UnpackedValue::new_function(move |list| {
                         let list = extract_typed!("elem", List(list));
-                        for value in unsafe { (*list.get()).iter() } {
+                        for value in list.iter() {
                             // TODO: less cloning
-                            if value.clone().equal(needle.clone()).0 == Value::TRUE.0 {
+                            if value.evaluate().clone().equal(needle.clone()).0 == Value::TRUE.0 {
                                 return Value::TRUE;
                             }
                         }
@@ -2338,9 +2447,636 @@ fn create_root_scope() -> *mut Scope {
             );
 
             builtins.insert(
-                "add".to_string(),
-                UnpackedValue::new_function(|a| {
-                    UnpackedValue::new_function(move |b| a.clone().add(b)).pack()
+                "head".to_string(),
+                UnpackedValue::new_function(|list| extract_typed!("elemAt", List(list))[0].clone())
+                    .pack(),
+            );
+
+            builtins.insert(
+                "tail".to_string(),
+                UnpackedValue::new_function(|list| extract_typed!("elemAt", List(list)).last().unwrap().clone())
+                    .pack(),
+            );
+
+            builtins.insert(
+                "elemAt".to_string(),
+                UnpackedValue::new_function(|xs| {
+                    UnpackedValue::new_function(move |n| {
+                        let xs = extract_typed!("elemAt", List(xs));
+                        let n = extract_typed!("elemAt", Integer(n));
+                        xs.get(n as usize).unwrap().clone()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "all".to_string(),
+                UnpackedValue::new_function(|predicate| {
+                    let fun = extract_typed!("all", Function(predicate));
+                    UnpackedValue::new_function(move |list| {
+                        let list = extract_typed!("all", List(list));
+                        #[allow(clippy::redundant_closure)]
+                        // NOTE: It doesn't seem like Value::and implements FnMut?
+                        list.iter()
+                            .map(|element| unsafe {
+                                (fun.call)(predicate.clone(), element.clone())
+                            })
+                            .reduce(|a, b| Value::and(a, b))
+                            .unwrap_or(Value::TRUE)
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "any".to_string(),
+                UnpackedValue::new_function(|predicate| {
+                    let fun = extract_typed!("any", Function(predicate));
+                    UnpackedValue::new_function(move |list| {
+                        let list = extract_typed!("any", List(list));
+                        #[allow(clippy::redundant_closure)]
+                        for value in list.iter() {
+                            let UnpackedValue::Bool(value) =
+                                unsafe { (fun.call)(predicate.clone(), value.clone()) }
+                                    .into_unpacked()
+                            else {
+                                panic!("any predicate returned non-boolean")
+                            };
+                            if value {
+                                return Value::TRUE;
+                            }
+                        }
+                        Value::FALSE
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "mapAttrs".to_string(),
+                UnpackedValue::new_function(|mapper| {
+                    UnpackedValue::new_function(move |attrs| {
+                        let attrs = extract_typed!("mapAttrs", Attrset(attrs));
+                        let mut result = ValueMap::new();
+                        for (key, value) in attrs {
+                            result.insert(
+                                key.to_string(),
+                                call_value!(
+                                    "mapAttrs",
+                                    mapper.clone(),
+                                    UnpackedValue::new_string(key.clone()).pack(),
+                                    value.clone()
+                                ),
+                            );
+                        }
+                        UnpackedValue::new_attrset(result).pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "listToAttrs".to_string(),
+                UnpackedValue::new_function(|list| {
+                    let list = extract_typed!("listToAttrs", List(list));
+                    UnpackedValue::new_attrset(
+                        list.iter()
+                            .map(|item| {
+                                let attrset = extract_typed!("listToAttrs", Attrset(item));
+                                let name = extract_typed!(
+                                    "listToAttrs",
+                                    String(attrset.get("name").unwrap())
+                                );
+                                let value = attrset.get("value").unwrap();
+                                (Rc::unwrap_or_clone(name), value.clone())
+                            })
+                            .collect(),
+                    )
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "getAttr".to_string(),
+                UnpackedValue::new_function(|name| {
+                    let name = extract_typed!("getAttr", String(name));
+                    UnpackedValue::new_function(move |attrset| {
+                        let attrset = extract_typed!("getAttr", Attrset(attrset));
+                        attrset.get(name.as_str()).unwrap().clone()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "hasAttr".to_string(),
+                UnpackedValue::new_function(|name| {
+                    let name = extract_typed!("hasAttr", String(name));
+                    UnpackedValue::new_function(move |attrset| {
+                        let attrset = extract_typed!("hasAttr", Attrset(attrset));
+                        UnpackedValue::Bool(attrset.contains_key(name.as_str())).pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "intersectAttrs".to_string(),
+                UnpackedValue::new_function(|e1| {
+                    let e1 = extract_typed!("intersectAttrs", Attrset(e1));
+                    UnpackedValue::new_function(move |e2| {
+                        let e2 = extract_typed!("intersectAttrs", Attrset(e2));
+                        UnpackedValue::new_attrset(if e2.len() > e1.len() {
+                            e1.keys()
+                                .filter_map(|key| {
+                                    e1.get(key).map(|value| (key.clone(), value.clone()))
+                                })
+                                .collect()
+                        } else {
+                            e2.iter()
+                                .filter(|&(key, _)| e1.contains_key(key))
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect()
+                        })
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "removeAttrs".to_string(),
+                UnpackedValue::new_function(|attrs| {
+                    let attrs = extract_typed!("removeAttrs", Attrset(attrs));
+                    UnpackedValue::new_function(move |names| {
+                        let names = extract_typed!("removeAttrs", List(names))
+                            .iter()
+                            .map(|value| extract_typed!("removeAttrs", String(value)))
+                            .collect::<HashSet<_>>();
+                        UnpackedValue::new_attrset(
+                            attrs
+                                .iter()
+                                .filter(|(key, _)| names.contains(*key))
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect(),
+                        )
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "zipAttrsWith".to_string(),
+                UnpackedValue::new_function(|mapper| {
+                    UnpackedValue::new_function(move |sets| {
+                        UnpackedValue::new_attrset(
+                            extract_typed!("zipAttrsWith", List(sets))
+                                .iter()
+                                .fold(HashMap::<String, Vec<Value>>::new(), |mut acc, value| {
+                                    for (key, value) in
+                                        extract_typed!("zipAttrsWith", Attrset(value))
+                                    {
+                                        acc.entry(key.to_string())
+                                            .or_insert_with(Vec::new)
+                                            .push(value.clone())
+                                    }
+                                    acc
+                                })
+                                .into_iter()
+                                .map(|(key, values)| {
+                                    (
+                                        key.clone(),
+                                        call_value!(
+                                            "zipAttrsWith",
+                                            mapper.clone(),
+                                            UnpackedValue::new_string(key).pack(),
+                                            UnpackedValue::new_list(values).pack()
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                        )
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "getEnv".to_string(),
+                UnpackedValue::new_function(|name| {
+                    let name = extract_typed!("getEnv", String(name));
+                    UnpackedValue::new_string(match std::env::var(name.as_str()) {
+                        Ok(value) => value,
+                        Err(VarError::NotPresent) => String::new(),
+                        Err(VarError::NotUnicode(_)) => panic!("getEnv var is not unicode"),
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "attrNames".to_string(),
+                UnpackedValue::new_function(|attrset| {
+                    let attrset = extract_typed!("attrNames", Attrset(attrset));
+
+                    UnpackedValue::new_list(
+                        attrset
+                            .keys()
+                            .cloned()
+                            .map(UnpackedValue::new_string)
+                            .map(UnpackedValue::pack)
+                            .collect(),
+                    )
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "attrValues".to_string(),
+                UnpackedValue::new_function(|attrset| {
+                    let attrset = extract_typed!("attrValues", Attrset(attrset));
+
+                    UnpackedValue::new_list(attrset.values().cloned().collect()).pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "catAttrs".to_string(),
+                UnpackedValue::new_function(|name| {
+                    let name = extract_typed!("catAttrs", String(name));
+
+                    UnpackedValue::new_function(move |attrlist| {
+                        let mut result = vec![];
+                        let list = extract_typed!("catAttrs", List(attrlist));
+                        for value in list.iter() {
+                            let attrset = extract_typed!("catAttrs", Attrset(value));
+                            if let Some(value) = attrset.get(name.as_str()) {
+                                result.push(value.clone());
+                            }
+                        }
+                        UnpackedValue::new_list(result).pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "groupBy".to_string(),
+                UnpackedValue::new_function(|f| {
+                    UnpackedValue::new_function(move |list| {
+                        let mut result = BTreeMap::new();
+                        let list = extract_typed!("groupBy", List(list));
+                        for value in list.iter() {
+                            let key = extract_typed!(
+                                "groupBy",
+                                String(call_value!("groupBy", f.clone(), value.clone()))
+                            );
+                            result
+                                .entry(Rc::unwrap_or_clone(key))
+                                .or_insert_with(Vec::new)
+                                .push(value.clone());
+                        }
+                        UnpackedValue::new_attrset(
+                            result
+                                .into_iter()
+                                .map(|(k, v)| (k, UnpackedValue::new_list(v).pack()))
+                                .collect(),
+                        )
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "genericClosure".to_string(),
+                UnpackedValue::new_function(|_args| todo!("Implement builtins.genericClosure"))
+                    .pack(),
+            );
+
+            // TODO: merge this with Value::operator methods
+            macro_rules! binary_operator {
+                ($name: literal $(, int => $op_int: tt)? $(, bool => $op_bool: tt)?) => {
+                    builtins.insert(
+                        $name.to_string(),
+                        UnpackedValue::new_function(|a| {
+                            UnpackedValue::new_function(move |b| match (a.unpack(), b.into_unpacked()) {
+                                $(
+                                    (UnpackedValue::Integer(a), UnpackedValue::Integer(b)) => {
+                                        (a $op_int b).into()
+                                    }
+                                )?
+                                $(
+                                    (UnpackedValue::Bool(a), UnpackedValue::Bool(b)) => {
+                                        (a $op_bool b).into()
+                                    }
+                                )?
+                                (a, b) => panic!(concat!("builtins.", $name, " not supported between values of type {} and {}"), a.kind(), b.kind())
+                            }).pack()
+                        })
+                        .pack(),
+                    );
+                }
+            }
+
+            binary_operator!("add", int => +);
+            binary_operator!("sub", int => -);
+            binary_operator!("mul", int => *);
+            binary_operator!("div", int => /);
+            binary_operator!("lessThan", int => <);
+            binary_operator!("bitAnd", int => &);
+            binary_operator!("bitOr", int => |);
+            binary_operator!("bitXor", int => ^);
+
+            builtins.insert(
+                "length".to_string(),
+                UnpackedValue::new_function(|list| {
+                    let list = extract_typed!("length", List(list));
+                    UnpackedValue::Integer(list.len() as i32).pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "foldl'".to_string(),
+                UnpackedValue::new_function(|op| {
+                    UnpackedValue::new_function(move |nul| {
+                        let op = op.clone();
+                        UnpackedValue::new_function(move |list| {
+                            let mut acc = nul.clone();
+                            let list = extract_typed!("foldl'", List(list));
+                            for value in list.iter() {
+                                acc = call_value!("foldl'", op.clone(), acc, value.clone());
+                            }
+                            acc
+                        }).pack()
+                    }).pack()
+                }).pack(),
+            );
+
+            builtins.insert(
+                "partition".to_string(),
+                UnpackedValue::new_function(|pred| {
+                    UnpackedValue::new_function(move |list| {
+                        let list = extract_typed!("partition", List(list));
+                        let (right, wrong) = list.iter().cloned().partition(|value|
+                            extract_typed!("partition", Bool(call_value!("partition", pred.clone(), value.clone()))
+                            ));
+                        UnpackedValue::new_attrset({
+                            let mut result = ValueMap::new();
+                            result.insert("right".to_string(), UnpackedValue::new_list(right).pack());
+                            result.insert("wrong".to_string(), UnpackedValue::new_list(wrong).pack());
+                            result
+                        }).pack()
+                    }).pack()
+                }).pack(),
+            );
+
+            builtins.insert(
+                "sort".to_string(),
+                UnpackedValue::new_function(|_comparator| {
+                    UnpackedValue::new_function(move |list| {
+                        let list = extract_typed!("sort", List(list));
+                        let mut result: Vec<_> = list.iter().map(Value::unpack).collect();
+                        todo!("builtins.sort");
+                        UnpackedValue::new_list(result.into_iter().map(UnpackedValue::pack).collect()).pack()
+                    }).pack()
+                }).pack()
+            );
+
+
+            builtins.insert(
+                "concatLists".to_string(),
+                UnpackedValue::new_function(|lists| {
+                    let lists = extract_typed!("concatLists", List(lists));
+                    UnpackedValue::new_list(
+                        lists
+                            .iter()
+                            .flat_map(|list| extract_typed!("concatLists", List(list)).iter())
+                            .cloned()
+                            .collect(),
+                    )
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "concatMap".to_string(),
+                UnpackedValue::new_function(|mapper| {
+                    UnpackedValue::new_function(move |lists| {
+                        let lists = extract_typed!("concatMap", List(lists));
+                        UnpackedValue::new_list(
+                            lists
+                                .iter()
+                                .flat_map(|list| extract_typed!("concatLists", List(list)).iter())
+                                .cloned()
+                                .map(|value| call_value!("concatMap", mapper.clone(), value))
+                                .collect(),
+                        )
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "concatStringsSep".to_string(),
+                UnpackedValue::new_function(|sep| {
+                    let sep = extract_typed!("concatStringsSep", String(sep));
+                    UnpackedValue::new_function(move |strings| {
+                        let strings = extract_typed!("concatStringsSep", List(strings));
+                        UnpackedValue::new_string({
+                            let mut result = String::new();
+                            let mut it = strings.iter();
+                            if let Some(first) = it.next() {
+                                result +=
+                                    extract_typed!("concatStringsSep", String(first)).as_str();
+                            }
+                            for string in it {
+                                result += sep.as_str();
+                                result +=
+                                    extract_typed!("concatStringsSep", String(string)).as_str();
+                            }
+                            result
+                        })
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "stringLength".to_string(),
+                UnpackedValue::new_function(|string| {
+                    let string = extract_typed!("stringLength", String(string));
+                    UnpackedValue::Integer(string.len() as i32).pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "substring".to_string(),
+                UnpackedValue::new_function(|start| {
+                    UnpackedValue::new_function(move |len| {
+                        let start = start.clone();
+                        UnpackedValue::new_function(move |string| {
+                            let start = extract_typed!("substring", Integer(start)) as usize;
+                            let len = extract_typed!("substring", Integer(len));
+                            let string = extract_typed!("substring", String(string));
+
+                            UnpackedValue::new_string(if start >= string.len() {
+                                String::new()
+                            } else if len == -1 {
+                                string[start..].to_string()
+                            } else {
+                                string[start..(start + len as usize)].to_string()
+                            })
+                            .pack()
+                        })
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "replaceStrings".to_string(),
+                UnpackedValue::new_function(|from| {
+                    UnpackedValue::new_function(move |to| {
+                        let from = from.clone();
+                        UnpackedValue::new_function(move |s| {
+                            let from = extract_typed!("replaceStrings", List(from));
+                            let to = extract_typed!("replaceStrings", List(to));
+                            let s = extract_typed!("replaceStrings", String(s));
+                            let mut result = Rc::unwrap_or_clone(s);
+
+                            for (i, pattern) in from.iter().enumerate() {
+                                let pattern = extract_typed!("replaceStrings", String(pattern));
+                                // FIXME: make this actually efficient
+                                if result.contains(pattern.as_str()) {
+                                    result = result.replace(
+                                        pattern.as_str(),
+                                        extract_typed!("replaceStrings", String(to[i])).as_str(),
+                                    );
+                                }
+                            }
+
+                            UnpackedValue::new_string(result).pack()
+                        })
+                        .pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "match".to_string(),
+                UnpackedValue::new_function(|regex| {
+                    let regex = Regex::new(extract_typed!("match", String(regex)).as_str()).unwrap();
+                    UnpackedValue::new_function(move |string| {
+                        let string = extract_typed!("match", String(string));
+                        regex.is_match(string.as_str()).into()
+                    }).pack()
+                }).pack()
+            );
+
+            builtins.insert(
+                "pathExists".to_string(),
+                UnpackedValue::new_function(|path| {
+                    let path = extract_typed!("pathExists", Path(path));
+                    UnpackedValue::Bool(
+                        path.try_exists().unwrap()
+                    )
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "readFile".to_string(),
+                UnpackedValue::new_function(|path| {
+                    let path = extract_typed!("readFile", Path(path));
+                    UnpackedValue::new_string(
+                        std::fs::read_to_string(&*path).unwrap()
+                    )
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "readFileType".to_string(),
+                UnpackedValue::new_function(|path| {
+                    let path = extract_typed!("readFileType", Path(path));
+                    let file_type = path.metadata().unwrap().file_type();
+                    UnpackedValue::new_string(
+                        if file_type.is_dir() {
+                            "directory"
+                        } else if file_type.is_file() {
+                            "regular"
+                        } else if file_type.is_symlink() {
+                            "symlink"
+                        } else {
+                            "unknown"
+                        }
+                        .to_string(),
+                    )
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "genList".to_string(),
+                UnpackedValue::new_function(|generator| {
+                    UnpackedValue::new_function(move |length| {
+                        let mut result = vec![];
+                        for i in 0..extract_typed!("genList", Integer(length)) {
+                            result.push(call_value!(
+                                "genList",
+                                generator.clone(),
+                                UnpackedValue::Integer(i).pack()
+                            ))
+                        }
+                        UnpackedValue::new_list(result).pack()
+                    })
+                    .pack()
+                })
+                .pack(),
+            );
+
+            builtins.insert(
+                "currentSystem".to_string(),
+                UnpackedValue::new_string("x86_64-linux".to_string()).pack(),
+            );
+
+            builtins.insert(
+                "hasContext".to_string(),
+                UnpackedValue::new_function(|_string| {
+                    Value::FALSE
                 })
                 .pack(),
             );
@@ -2417,7 +3153,7 @@ fn seq(value: &Value, deep: bool) {
         UnpackedValue::Attrset(value) => {
             let map = unsafe { &mut *value.get() };
             for (key, value) in map.iter_mut() {
-                eprintln!("seq: evaluating key {key}");
+                // eprintln!("seq: evaluating key {key}");
                 let value = value.evaluate();
                 if deep {
                     seq(value, deep);
