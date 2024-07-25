@@ -11,7 +11,6 @@ use std::{
     env::VarError,
     ffi::CStr,
     fmt::{Debug, Display, Write},
-    fs::FileType,
     mem::{offset_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
     os::raw::c_void,
@@ -20,7 +19,8 @@ use std::{
     rc::Rc,
 };
 
-use iced_x86::code_asm::*;
+use dwarf::*;
+use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 use regex::Regex;
 use rnix::ast::{Attr, Attrpath, Expr, HasEntry, InterpolPart, Str};
@@ -331,8 +331,9 @@ struct Executable {
     _referenced_executables: Vec<Rc<Executable>>,
     _referenced_values: Vec<Value>,
     _parameter: Option<Box<Parameter>>,
+    _eh_frame: Box<[u8]>,
     len: usize,
-    code: extern "C" fn(Value, Value) -> Value,
+    code: extern "C-unwind" fn(Value, Value) -> Value,
 }
 
 impl Executable {
@@ -426,7 +427,11 @@ impl Deref for Scope {
     }
 }
 
-unsafe extern "C" fn scope_lookup(scope: *mut Scope, name: *const u8, name_len: usize) -> Value {
+unsafe extern "C-unwind" fn scope_lookup(
+    scope: *mut Scope,
+    name: *const u8,
+    name_len: usize,
+) -> Value {
     let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, name_len));
     Scope::lookup(scope, name)
 }
@@ -729,6 +734,159 @@ enum Parameter {
     },
 }
 
+mod dwarf;
+fn leb128(out: &mut Vec<u8>, mut value: u64) {
+    if value == 0 {
+        out.push(0);
+    } else {
+        while value > 0 {
+            let mut current = (value & 0x7F) as u8;
+            value >>= 7;
+            if value > 0 {
+                current |= 1 << 7;
+            }
+            out.push(current);
+        }
+    }
+}
+
+fn dwarf_align(data: &mut Vec<u8>, start: usize) {
+    let real_length = data.len() - start;
+    let aligned_length = real_length.next_multiple_of(8);
+    data[start..start + 4].copy_from_slice(&((aligned_length - 4) as u32).to_le_bytes());
+    for _ in real_length..aligned_length {
+        DW_CFA_nop(data);
+    }
+}
+
+mod sysvunwind;
+use sysvunwind::*;
+
+const NIX_EXCEPTION_CLASS_SLICE: &[u8; 8] = b"FSH\0NIX\0";
+const NIX_EXCEPTION_CLASS: u64 = u64::from_le_bytes(*NIX_EXCEPTION_CLASS_SLICE);
+
+unsafe extern "C" fn nix_exception_cleanup(
+    code: _Unwind_Reason_Code,
+    object: *const _Unwind_Exception,
+) {
+    println!("Nix exception deleted: {code:?}")
+}
+
+#[no_mangle]
+unsafe extern "C" fn eh_personality(
+    version: std::ffi::c_int,
+    actions: std::ffi::c_int,
+    exception: *const _Unwind_Exception,
+    context: *const _Unwind_Context,
+) -> _Unwind_Reason_Code {
+    assert_eq!(version, 1);
+    println!(
+        "EH PERSONALITY CALLED SEARCH:{} CLEANUP:{} -> _URC_CONTINUE_UNWIND",
+        actions & _UA_SEARCH_PHASE > 0,
+        actions & _UA_CLEANUP_PHASE > 0
+    );
+    if actions & _UA_CLEANUP_PHASE > 0 {
+        // TODO: Cleanup stack
+        //       This requires saving more information in unwind data.
+        //       (we need to know when the stack pointer was when the unwind happened)
+    }
+    _URC_CONTINUE_UNWIND
+}
+
+#[derive(Debug)]
+struct Fde {
+    initial_location: u64,
+    address_range: u64,
+}
+
+fn create_eh_frame(
+    fdes: impl IntoIterator<Item = Fde>,
+    cie_instruction_builder: impl FnOnce(&mut Vec<u8>),
+    fde_instruction_builder: impl Fn(usize, &Fde, &mut Vec<u8>),
+) -> Vec<u8> {
+    let mut data = vec![];
+
+    // CIE
+    {
+        // length
+        data.extend([0u8; 4]);
+        // CIE_id
+        data.extend(0u32.to_le_bytes());
+        // version
+        data.push(1);
+        // augmentation
+        data.extend(b"zP\0");
+        // code_alignment_factor
+        leb128(&mut data, 1);
+        // data_alignment_factor
+        leb128(&mut data, 1);
+        // return_address_register
+        data.push(16);
+        // leb128(&mut data, /* "Return adddress RA" */ 16);
+        // optional CIE augmentation section
+        leb128(&mut data, 9);
+        data.push(0x00); // absolute pointer
+        data.extend((eh_personality as u64).to_le_bytes());
+        // initial_instructions
+        cie_instruction_builder(&mut data);
+    }
+
+    dwarf_align(&mut data, 0);
+    // dbg!(&data, data.len());
+
+    // FDEs
+    {
+        for (i, fde) in fdes.into_iter().enumerate() {
+            println!("fde {i} starts at address offset {}", data.len());
+            let fde_start = data.len();
+            // length
+            data.extend([0u8; 4]);
+            // CIE_pointer
+            data.extend(dbg!(data.len() as u32).to_le_bytes());
+            // initial_location
+            data.extend(fde.initial_location.to_le_bytes());
+            // address_range
+            data.extend(fde.address_range.to_le_bytes());
+            // fde augmentation section
+            leb128(&mut data, 0);
+            // call frame instructions
+            let fde_program_start = data.len();
+            fde_instruction_builder(i, &fde, &mut data);
+            eprintln!("program for fde {i} is {:?}", &data[fde_program_start..]);
+            dwarf_align(&mut data, fde_start);
+            eprintln!("fde {:?}", &data[fde_start..])
+        }
+    }
+
+    // libgcc detects the end of an .eh_frame section via the presence of a zero-length FDE
+    // see https://github.com/llvm/llvm-project/blob/1055c5e1d316164c70e0c9f016411a28f3b4792e/llvm/lib/ExecutionEngine/Orc/TargetProcess/RegisterEHFrames.cpp#L128
+    data.extend([0, 0, 0, 0]);
+
+    data
+}
+
+// This will be useful when supporting non-libgcc unwinders
+// (i.e. libunwind which doesn't accept whole .eh_frame sections but single FDEs)
+fn walk_eh_frame_fdes(eh_frame: &[u8], callback: impl Fn(usize)) {
+    let mut offset = 0;
+    while offset < eh_frame.len() {
+        let current = &eh_frame[offset..];
+        let len = u32::from_le_bytes(current[0..4].try_into().unwrap()) as usize;
+        if len == 0 {
+            offset += 4;
+            break;
+        }
+        let cie_pointer = u32::from_le_bytes(current[4..8].try_into().unwrap());
+        if cie_pointer == 0 {
+            // is a cie
+        } else {
+            callback(offset);
+        }
+        offset += len + 4;
+    }
+    assert_eq!(offset, eh_frame.len());
+}
+
 impl Program {
     fn new() -> Self {
         Self { operations: vec![] }
@@ -758,8 +916,18 @@ impl Program {
             ptr
         };
         let parameter = param.map(Box::new);
-        let code = {
+        let function_enter: CodeLabel;
+        let function_leave: CodeLabel;
+        let result = {
             let mut asm = CodeAssembler::new(64)?;
+
+            macro_rules! create_label_here {
+                () => {{
+                    let mut l = asm.create_label();
+                    asm.set_label(&mut l)?;
+                    l
+                }};
+            }
 
             asm.push(rbp)?;
             asm.mov(rbp, rsp)?;
@@ -771,6 +939,7 @@ impl Program {
             asm.push(r14)?;
             // invariant: r15 contains our scope (set by the caller)
             // asm.push(r15)?;
+            function_enter = create_label_here!();
 
             // These values are always kept here
             asm.mov(r13, ATTRSET_TAG_LAZY)?;
@@ -1525,9 +1694,14 @@ impl Program {
             asm.pop(rbx)?;
 
             asm.leave()?;
+            function_leave = create_label_here!();
             asm.ret()?;
 
-            asm.assemble(0)?
+            asm.assemble_options(
+                0,
+                BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS
+                    | BlockEncoderOptions::DONT_FIX_BRANCHES,
+            )?
         };
 
         // eprintln!("{}", debug_header);
@@ -1541,6 +1715,7 @@ impl Program {
         // }
 
         unsafe {
+            let code = &result.inner.code_buffer;
             let code_mem = nix::libc::mmap(
                 std::ptr::null_mut(),
                 code.len(),
@@ -1556,10 +1731,58 @@ impl Program {
             if nix::libc::mprotect(code_mem as *mut c_void, code.len(), PROT_EXEC | PROT_READ) < 0 {
                 panic!("mprotect failed");
             }
+
+            #[allow(unused_assignments)]
+            let frame = create_eh_frame(
+                [Fde {
+                    initial_location: code_mem as u64,
+                    address_range: dbg!(code.len()) as u64,
+                }],
+                // TODO: The CIE could be shared
+                |cie| {
+                    DW_CFA_advance_loc(cie, dbg!(result.label_ip(&function_enter).unwrap()) as u8);
+                    DW_CFA_offset(cie, 16, (-8i64) as u64);
+                    DW_CFA_offset(cie, 14, 0);
+                    DW_CFA_offset(cie, 13, 8);
+                    DW_CFA_offset(cie, 12, 16);
+                    DW_CFA_offset(cie, 3, 24);
+                },
+                |_index, _fde, out: &mut Vec<u8>| {
+                    let mut ip = 0u64;
+                    macro_rules! advance_to {
+                        ($fun: ident[$width: ident], $x: expr) => {{
+                            let _x: u64 = $x;
+                            let advance = dbg!(_x - ip);
+                            $fun(out, advance as $width);
+                            ip += advance;
+                        }};
+                    }
+
+                    advance_to!(
+                        DW_CFA_advance_loc[u8],
+                        dbg!(result.label_ip(&function_enter).unwrap())
+                    );
+                    DW_CFA_def_cfa(out, /* rbp */ 6, 16);
+                    advance_to!(
+                        DW_CFA_advance_loc4[u32],
+                        dbg!(result.label_ip(&function_leave).unwrap())
+                    );
+                    DW_CFA_def_cfa(out, /* rsp */ 7, 8);
+                },
+            )
+            .into_boxed_slice();
+            println!("{:?}", frame.as_ptr());
+            // walk_eh_frame_fdes(&frame[..], |offset| {
+            //     println!("registering fde at offset {offset}");
+            //     __register_frame(frame.as_ptr().add(offset));
+            // });
+            dbg!(__register_frame(frame.as_ptr()));
+
             Ok(Executable {
                 _referenced_values: referenced_values,
                 _referenced_executables: referenced_executables,
                 _referenced_strings: referenced_strings,
+                _eh_frame: frame,
                 _parameter: parameter,
                 code: std::mem::transmute(code_mem),
                 len: code.len(),
@@ -1600,7 +1823,7 @@ enum ValueKind {
 }
 
 struct Function {
-    call: unsafe extern "C" fn(Value, Value) -> Value,
+    call: unsafe extern "C-unwind" fn(Value, Value) -> Value,
     _executable: Option<Rc<Executable>>,
     builtin_closure: Option<Box<dyn FnMut(Value) -> Value>>,
     parent_scope: *const Scope,
@@ -1750,7 +1973,7 @@ impl<T: Into<UnpackedValue>> From<T> for Value {
     }
 }
 
-unsafe extern "C" fn call_builtin(fun: Value, value: Value) -> Value {
+unsafe extern "C-unwind" fn call_builtin(fun: Value, value: Value) -> Value {
     let this = (fun.0 & !VALUE_TAG_MASK) as *mut Function;
     // eprintln!(
     //     "call_builtin HeapValue:{:?} arg:{value:?}",
@@ -2648,7 +2871,7 @@ fn create_root_scope() -> *mut Scope {
                                         extract_typed!("zipAttrsWith", Attrset(value))
                                     {
                                         acc.entry(key.to_string())
-                                            .or_insert_with(Vec::new)
+                                            .or_default()
                                             .push(value.clone())
                                     }
                                     acc
@@ -3104,11 +3327,22 @@ fn create_root_scope() -> *mut Scope {
         })
         .pack(),
     );
+
     values.insert(
         "__trace_shallow".to_string(),
         UnpackedValue::new_function(|value: Value| {
             println!("trace (shallow): {value:?}");
             UnpackedValue::new_function(|value| value).pack()
+        })
+        .pack(),
+    );
+    values.insert(
+        "__panic".to_string(),
+        UnpackedValue::new_function(|_value: Value| {
+            let exception = _Unwind_Exception::new(NIX_EXCEPTION_CLASS, nix_exception_cleanup);
+            let result = unsafe { _Unwind_RaiseException(&exception as *const _Unwind_Exception) };
+            eprintln!("_Unwind_RaiseException: {result:?}");
+            std::process::abort();
         })
         .pack(),
     );
@@ -3194,7 +3428,33 @@ fn scope_from_map_get_works() {
     }
 }
 
+fn dwarf_testing() {
+    let executable = Program {
+        operations: vec![
+            Operation::Push(Value::NULL),
+            Operation::Push(
+                UnpackedValue::new_function(|_| {
+                    let exception =
+                        _Unwind_Exception::new(NIX_EXCEPTION_CLASS, nix_exception_cleanup);
+                    let result =
+                        unsafe { _Unwind_RaiseException(&exception as *const _Unwind_Exception) };
+                    eprintln!("_Unwind_RaiseException: {result:?}");
+                    std::process::abort()
+                })
+                .pack(),
+            ),
+            Operation::Apply,
+        ],
+    }
+    .compile(None)
+    .unwrap();
+    let result = executable.run(std::ptr::null_mut(), &Value::NULL);
+    println!("{result:?}");
+    std::process::abort();
+}
+
 fn main() {
+    // dwarf_testing();
     let value = import(&PathBuf::from(std::env::args().nth(1).unwrap()));
     seq(&value, true);
     println!("{}", value);
