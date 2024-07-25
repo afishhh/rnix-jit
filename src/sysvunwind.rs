@@ -5,6 +5,7 @@ use std::ffi::{c_int, c_void};
 
 pub type _Unwind_Exception_Cleanup_Fn =
     unsafe extern "C" fn(_Unwind_Reason_Code, *const _Unwind_Exception);
+
 pub type _Unwind_Personality_Fn = unsafe extern "C" fn(
     c_int,
     _Unwind_Action,
@@ -39,7 +40,7 @@ impl _Unwind_Exception {
             class,
             cleanup,
             private_1: 0,
-            private_2: 0
+            private_2: 0,
         }
     }
 }

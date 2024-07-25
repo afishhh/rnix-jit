@@ -324,6 +324,7 @@ pub mod x86_64 {
     pub use super::DW_OP_reg7 as DW_OP_reg_rsp;
     pub use super::DW_OP_reg8 as DW_OP_reg_r8;
     pub use super::DW_OP_reg9 as DW_OP_reg_r9;
+
     pub use super::DW_OP_reg10 as DW_OP_reg_r10;
     pub use super::DW_OP_reg11 as DW_OP_reg_r11;
     pub use super::DW_OP_reg12 as DW_OP_reg_r12;
@@ -335,6 +336,7 @@ pub mod x86_64 {
     pub use super::DW_OP_reg18 as DW_OP_reg_xmm1;
     pub use super::DW_OP_reg19 as DW_OP_reg_xmm2;
     pub use super::DW_OP_reg20 as DW_OP_reg_xmm3;
+
     pub use super::DW_OP_reg21 as DW_OP_reg_xmm4;
     pub use super::DW_OP_reg22 as DW_OP_reg_xmm5;
     pub use super::DW_OP_reg23 as DW_OP_reg_xmm6;
@@ -346,6 +348,7 @@ pub mod x86_64 {
     pub use super::DW_OP_reg29 as DW_OP_reg_xmm12;
     pub use super::DW_OP_reg30 as DW_OP_reg_xmm13;
     pub use super::DW_OP_reg31 as DW_OP_reg_xmm14;
+
     define_dwarf_extended_registers! {
         DW_OP_reg_xmm15 = 32;
         DW_OP_reg_st0 = 33;
