@@ -2144,7 +2144,7 @@ fn scope_from_map_get_works() {
 }
 
 fn dwarf_testing() {
-    let executable = compiler::compile(
+    let function = compiler::compile(
         Program {
             operations: vec![
                 Operation::Push(Value::NULL),
@@ -2166,13 +2166,32 @@ fn dwarf_testing() {
         None,
     )
     .unwrap();
+    let executable = compiler::compile(
+        Program {
+            operations: vec![
+                Operation::Push(Value::NULL),
+                Operation::Push(UnpackedValue::Function(Rc::new(Function {
+                    call: function.code(),
+                    _executable: None,
+                    builtin_closure: None,
+                    parent_scope: std::ptr::null_mut(),
+                })).pack()),
+                Operation::Apply,
+            ],
+        },
+        None,
+    )
+    .unwrap();
+    // std::panic::catch_unwind(|| {
     let result = executable.run(std::ptr::null_mut(), &Value::NULL);
     println!("{result:?}");
     std::process::abort();
+    // })
+    // .unwrap_or(())
 }
 
 fn main() {
-    // dwarf_testing();
+    dwarf_testing();
     let value = import(&PathBuf::from(std::env::args().nth(1).unwrap()));
     seq(&value, true);
     println!("{}", value);

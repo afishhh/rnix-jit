@@ -1,9 +1,7 @@
 use std::{arch::asm, ffi::c_void, mem::offset_of, rc::Rc};
 
 use crate::{
-    create_eh_frame, dwarf::*, sysvunwind::__register_frame, Fde, Function, Operation, Parameter,
-    Program, Scope, Value, ValueKind, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK,
-    VALUE_TAG_WIDTH,
+    create_eh_frame, dwarf::*, sysvunwind::__register_frame, Fde, Function, Operation, Parameter, Program, Scope, Value, ValueKind, __deregister_frame, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -85,7 +83,7 @@ pub struct Executable {
     // FIXME: this doesn't seem to work
     //        Do we have reference cycles here?
     _closure: ExecutableClosure,
-    _eh_frame: Box<[u8]>,
+    eh_frame: Box<[u8]>,
     len: usize,
     code: extern "C-unwind" fn(Value, Value) -> Value,
 }
@@ -111,6 +109,7 @@ impl Drop for Executable {
             if nix::libc::munmap(self.code as *mut c_void, self.len) < 0 {
                 panic!("munmap failed");
             }
+            __deregister_frame(self.eh_frame.as_ptr());
         }
     }
 }
@@ -995,11 +994,12 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                     cie,
                     result.new_instruction_offsets[function_enter_ins] as u8,
                 );
+                DW_CFA_def_cfa(cie, 7, 8);
                 DW_CFA_offset(cie, 16, 1);
-                DW_CFA_offset(cie, 14, 0);
-                DW_CFA_offset(cie, 13, (-1i64) as u64);
-                DW_CFA_offset(cie, 12, (-2i64) as u64);
-                DW_CFA_offset(cie, 3, (-3i64) as u64);
+                // DW_CFA_offset(cie, 14, 0);
+                // DW_CFA_offset(cie, 13, (-1i64) as u64);
+                // DW_CFA_offset(cie, 12, (-2i64) as u64);
+                // DW_CFA_offset(cie, 3, (-3i64) as u64);
             },
             |_index, _fde, out: &mut Vec<u8>| {
                 let mut ip = 0u64;
@@ -1016,7 +1016,9 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                     DW_CFA_advance_loc[u8],
                     result.new_instruction_offsets[function_enter_ins].into()
                 );
-                DW_CFA_def_cfa(out, /* rbp */ 6, 16);
+                DW_CFA_def_cfa_offset(out, 16);
+                DW_CFA_offset(out, /* rbp */ 6, 2);
+                DW_CFA_def_cfa_register(out, /* rbp */ 6);
                 advance_to!(
                     DW_CFA_advance_loc4[u32],
                     result.new_instruction_offsets[function_leave_ins].into()
@@ -1030,11 +1032,11 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
         //     println!("registering fde at offset {offset}");
         //     __register_frame(frame.as_ptr().add(offset));
         // });
-        // dbg!(__register_frame(frame.as_ptr()));
+        __register_frame(frame.as_ptr());
 
         Ok(Executable {
             _closure: closure,
-            _eh_frame: frame,
+            eh_frame: frame,
             code: std::mem::transmute(code_mem),
             len: code.len(),
         })

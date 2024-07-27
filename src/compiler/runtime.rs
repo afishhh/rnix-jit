@@ -15,7 +15,7 @@ pub unsafe extern "C-unwind" fn scope_lookup(
     Scope::lookup(scope, name)
 }
 
-pub unsafe extern "C" fn create_function_scope(
+pub unsafe extern "C-unwind" fn create_function_scope(
     previous: *mut Scope,
     mut value: Value,
     parameter: *const CompiledParameter,
