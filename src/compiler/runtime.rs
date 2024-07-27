@@ -17,7 +17,7 @@ pub unsafe extern "C-unwind" fn scope_lookup(
 
 pub unsafe extern "C" fn create_function_scope(
     previous: *mut Scope,
-    value: Value,
+    mut value: Value,
     parameter: *const CompiledParameter,
 ) -> *mut Scope {
     match &*parameter {
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn create_function_scope(
             binding,
             ignore_unmatched,
         } => {
-            let UnpackedValue::Attrset(heapvalue) = value.unpack() else {
+            let UnpackedValue::Attrset(heapvalue) = value.evaluate_mut().unpack() else {
                 panic!("cannot unpack non-attrset value in pattern parameter");
             };
             let scope = Scope::from_map(ValueMap::new(), previous);

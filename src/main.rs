@@ -1931,6 +1931,17 @@ fn create_root_scope() -> *mut Scope {
             );
 
             builtins.insert(
+                "split".to_string(),
+                UnpackedValue::new_function(|regex| {
+                    let regex = Regex::new(extract_typed!("split", String(move regex)).as_str()).unwrap();
+                    UnpackedValue::new_function(move |string| {
+                        let string = extract_typed!("split", String(move string));
+                        UnpackedValue::new_list(regex.split(&string).map(|part| UnpackedValue::new_string(part.to_string()).pack()).collect()).pack()
+                    }).pack()
+                }).pack()
+            );
+
+            builtins.insert(
                 "pathExists".to_string(),
                 UnpackedValue::new_function(|path| {
                     let path = extract_typed!("pathExists", Path(move path));
