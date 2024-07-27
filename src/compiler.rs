@@ -190,6 +190,15 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                 // rdi = Current function Value (if a function)
                 // rsi = Argument Value (if a function)
 
+                let mut not_a_function = asm.create_label();
+                let mut end = asm.create_label();
+
+                // SANITY CHECK: Make sure rdi is a function
+                asm.mov(rax, rdi)?;
+                asm.and(rax, VALUE_TAG_MASK as i32)?;
+                asm.cmp(al, ValueKind::Function as i32)?;
+                asm.jne(not_a_function)?;
+
                 asm.mov(
                     rdi,
                     qword_ptr(
@@ -201,6 +210,15 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                 asm.push(r15)?;
                 call!(rust create_function_scope);
                 asm.mov(r15, rax)?;
+                asm.jmp(end)?;
+
+                asm.set_label(&mut not_a_function)?;
+                asm.mov(rsi, rdi)?;
+                asm.mov(rdi, c"INTERNAL ERROR: Function receiver is not a Function".as_ptr() as u64)?;
+                asm.pop(r15)?;
+                call!(rust asm_panic_with_value);
+
+                asm.set_label(&mut end)?;
             }
 
             for operation in program.operations {
@@ -922,7 +940,6 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
             asm.assemble_options(
                 0,
                 BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS
-                    | BlockEncoderOptions::DONT_FIX_BRANCHES,
             )?
         }.inner;
 

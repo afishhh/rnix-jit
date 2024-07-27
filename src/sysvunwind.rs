@@ -52,6 +52,7 @@ pub struct _Unwind_Context {
 
 extern "C" {
     pub fn __register_frame(pointer: *const u8);
+    pub fn __deregister_frame(pointer: *const u8);
     pub fn _Unwind_RaiseException(exception: *const _Unwind_Exception) -> _Unwind_Reason_Code;
     pub fn _Unwind_Resume(exception: *const _Unwind_Exception);
     pub fn _Unwind_DeleteException(exception: *mut _Unwind_Exception);

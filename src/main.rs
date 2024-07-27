@@ -413,20 +413,6 @@ enum Parameter {
 }
 
 mod dwarf;
-fn leb128(out: &mut Vec<u8>, mut value: u64) {
-    if value == 0 {
-        out.push(0);
-    } else {
-        while value > 0 {
-            let mut current = (value & 0x7F) as u8;
-            value >>= 7;
-            if value > 0 {
-                current |= 1 << 7;
-            }
-            out.push(current);
-        }
-    }
-}
 
 fn dwarf_align(data: &mut Vec<u8>, start: usize) {
     let real_length = data.len() - start;
@@ -479,6 +465,8 @@ struct Fde {
 
 fn create_eh_frame(
     fdes: impl IntoIterator<Item = Fde>,
+    code_alignment_factor: u64,
+    data_alignment_factor: i64,
     cie_instruction_builder: impl FnOnce(&mut Vec<u8>),
     fde_instruction_builder: impl Fn(usize, &Fde, &mut Vec<u8>),
 ) -> Vec<u8> {
@@ -495,14 +483,14 @@ fn create_eh_frame(
         // augmentation
         data.extend(b"zP\0");
         // code_alignment_factor
-        leb128(&mut data, 1);
+        uleb128(&mut data, code_alignment_factor);
         // data_alignment_factor
-        leb128(&mut data, 1);
+        sleb128(&mut data, data_alignment_factor);
         // return_address_register
         data.push(16);
         // leb128(&mut data, /* "Return adddress RA" */ 16);
         // optional CIE augmentation section
-        leb128(&mut data, 9);
+        uleb128(&mut data, 9);
         data.push(0x00); // absolute pointer
         data.extend((eh_personality as u64).to_le_bytes());
         // initial_instructions
@@ -526,7 +514,7 @@ fn create_eh_frame(
             // address_range
             data.extend(fde.address_range.to_le_bytes());
             // fde augmentation section
-            leb128(&mut data, 0);
+            uleb128(&mut data, 0);
             // call frame instructions
             let fde_program_start = data.len();
             fde_instruction_builder(i, &fde, &mut data);
@@ -952,7 +940,9 @@ impl UnpackedValue {
             Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
-                    x.unpack().fmt_display_rec(depth, f)
+                    write!(f, "Lazy(")?;
+                    x.unpack().fmt_display_rec(depth, f)?;
+                    write!(f, ")")
                 } else {
                     write!(f, "...")
                 }
@@ -1081,6 +1071,17 @@ impl Value {
         }
     }
 
+    fn evaluate_mut(&mut self) -> &Value {
+        if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
+            unsafe {
+                LazyValue(Rc::from_raw((self.0 & !ATTRSET_TAG_MASK) as *mut _))
+                    .evaluate()
+                    .clone_into(self)
+            }
+        }
+        self
+    }
+
     fn into_evaluated(self) -> Value {
         if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
             unsafe {
@@ -1188,17 +1189,17 @@ fn create_root_scope() -> *mut Scope {
     let mut values = ValueMap::new();
 
     macro_rules! extract_typed {
-        ($builtin_name: literal, Attrset($value: expr)) => {
-            unsafe { &*extract_typed!(@impl $builtin_name, Attrset($value)).get() }
+        ($builtin_name: literal, Attrset($($tt: tt)*)) => {
+            unsafe { &*extract_typed!(@impl $builtin_name, Attrset($($tt)*)).get() }
         };
-        ($builtin_name: literal, List($value: expr)) => {
-            unsafe { &*extract_typed!(@impl $builtin_name, List($value)).get() }
+        ($builtin_name: literal, List($($tt: tt)*)) => {
+            unsafe { &*extract_typed!(@impl $builtin_name, List($($tt)*)).get() }
         };
-        ($builtin_name: literal, $what: ident($value: expr)) => {
-            extract_typed!(@impl $builtin_name, $what($value))
+        ($builtin_name: literal, $what: ident($($tt: tt)*)) => {
+            extract_typed!(@impl $builtin_name, $what($($tt)*))
         };
-        (@impl $builtin_name: literal, $what: ident($value: expr)) => {
-            match $value.evaluate().unpack() {
+        (@impl $builtin_name: literal, $what: ident($($value: tt)*)) => {
+            match extract_typed!(@evaluate_value $($value)*).unpack() {
                 UnpackedValue::$what(ptr) => ptr,
                 other => panic!(
                     concat!("builtin ", $builtin_name, " expected {} but got {}"),
@@ -1207,13 +1208,22 @@ fn create_root_scope() -> *mut Scope {
                 ),
             }
         };
+        (@evaluate_value move $value: expr) => {
+            $value.into_evaluated()
+        };
+        (@evaluate_value mut $value: expr) => {
+            $value.evaluate_mut()
+        };
+        (@evaluate_value ref $value: expr) => {
+            $value.evaluate()
+        };
     }
 
     macro_rules! call_value {
         ($builtin_name: literal, $value: expr $(, $args: expr)+) => {{
             let mut current = $value;
             $(
-                let fun = extract_typed!($builtin_name, Function(current));
+                let fun = extract_typed!($builtin_name, Function(mut current));
                 current = unsafe { (fun.call)(current, $args) };
             )+
             current
@@ -1221,16 +1231,14 @@ fn create_root_scope() -> *mut Scope {
     }
 
     let map_function = UnpackedValue::new_function(|fun| {
-        let mapper = extract_typed!("map", Function(fun));
         UnpackedValue::new_function(move |list| {
-            let list = extract_typed!("map", List(list));
+            let list = extract_typed!("map", List(move list));
             UnpackedValue::new_list(
                 list.iter()
                     .map(|x| {
-                        let mapper = mapper.clone();
                         let fun = fun.clone();
                         x.clone()
-                            .lazy_map(move |x| unsafe { (mapper.call)(fun, x) })
+                            .lazy_map(move |x| call_value!("map", fun.clone(), x))
                     })
                     .collect(),
             )
@@ -1271,12 +1279,12 @@ fn create_root_scope() -> *mut Scope {
                 UnpackedValue::new_function(|filter| {
                     UnpackedValue::new_function(move |list| {
                         UnpackedValue::new_list(
-                            extract_typed!("filter", List(list))
+                            extract_typed!("filter", List(move list))
                                 .iter()
                                 .filter(|x| {
                                     extract_typed!(
                                         "filter",
-                                        Bool(call_value!("filter", filter.clone(), (*x).clone()))
+                                        Bool(move call_value!("filter", filter.clone(), (*x).clone()))
                                     )
                                 })
                                 .cloned()
@@ -1348,7 +1356,7 @@ fn create_root_scope() -> *mut Scope {
                 "elem".to_string(),
                 UnpackedValue::new_function(|needle| {
                     UnpackedValue::new_function(move |list| {
-                        let list = extract_typed!("elem", List(list));
+                        let list = extract_typed!("elem", List(move list));
                         for value in list.iter() {
                             // TODO: less cloning
                             if value.evaluate().clone().equal(needle.clone()).0 == Value::TRUE.0 {
@@ -1364,13 +1372,13 @@ fn create_root_scope() -> *mut Scope {
 
             builtins.insert(
                 "head".to_string(),
-                UnpackedValue::new_function(|list| extract_typed!("elemAt", List(list))[0].clone())
+                UnpackedValue::new_function(|list| extract_typed!("elemAt", List(move list))[0].clone())
                     .pack(),
             );
 
             builtins.insert(
                 "tail".to_string(),
-                UnpackedValue::new_function(|list| extract_typed!("elemAt", List(list)).last().unwrap().clone())
+                UnpackedValue::new_function(|list| extract_typed!("elemAt", List(move list)).last().unwrap().clone())
                     .pack(),
             );
 
@@ -1378,8 +1386,8 @@ fn create_root_scope() -> *mut Scope {
                 "elemAt".to_string(),
                 UnpackedValue::new_function(|xs| {
                     UnpackedValue::new_function(move |n| {
-                        let xs = extract_typed!("elemAt", List(xs));
-                        let n = extract_typed!("elemAt", Integer(n));
+                        let xs = extract_typed!("elemAt", List(ref xs));
+                        let n = extract_typed!("elemAt", Integer(move n));
                         xs.get(n as usize).unwrap().clone()
                     })
                     .pack()
@@ -1390,14 +1398,13 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "all".to_string(),
                 UnpackedValue::new_function(|predicate| {
-                    let fun = extract_typed!("all", Function(predicate));
                     UnpackedValue::new_function(move |list| {
-                        let list = extract_typed!("all", List(list));
+                        let list = extract_typed!("all", List(move list));
                         #[allow(clippy::redundant_closure)]
                         // NOTE: It doesn't seem like Value::and implements FnMut?
                         list.iter()
                             .map(|element| unsafe {
-                                (fun.call)(predicate.clone(), element.clone())
+                                call_value!("all", predicate.clone(), element.clone())
                             })
                             .reduce(|a, b| Value::and(a, b))
                             .unwrap_or(Value::TRUE)
@@ -1410,14 +1417,12 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "any".to_string(),
                 UnpackedValue::new_function(|predicate| {
-                    let fun = extract_typed!("any", Function(predicate));
                     UnpackedValue::new_function(move |list| {
-                        let list = extract_typed!("any", List(list));
+                        let list = extract_typed!("any", List(move list));
                         #[allow(clippy::redundant_closure)]
                         for value in list.iter() {
                             let UnpackedValue::Bool(value) =
-                                unsafe { (fun.call)(predicate.clone(), value.clone()) }
-                                    .into_unpacked()
+                                call_value!("any", predicate.clone(), value.clone()).into_unpacked()
                             else {
                                 panic!("any predicate returned non-boolean")
                             };
@@ -1436,7 +1441,7 @@ fn create_root_scope() -> *mut Scope {
                 "mapAttrs".to_string(),
                 UnpackedValue::new_function(|mapper| {
                     UnpackedValue::new_function(move |attrs| {
-                        let attrs = extract_typed!("mapAttrs", Attrset(attrs));
+                        let attrs = extract_typed!("mapAttrs", Attrset(move attrs));
                         let mut result = ValueMap::new();
                         for (key, value) in attrs {
                             result.insert(
@@ -1459,14 +1464,14 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "listToAttrs".to_string(),
                 UnpackedValue::new_function(|list| {
-                    let list = extract_typed!("listToAttrs", List(list));
+                    let list = extract_typed!("listToAttrs", List(move list));
                     UnpackedValue::new_attrset(
                         list.iter()
                             .map(|item| {
-                                let attrset = extract_typed!("listToAttrs", Attrset(item));
+                                let attrset = extract_typed!("listToAttrs", Attrset(ref item));
                                 let name = extract_typed!(
                                     "listToAttrs",
-                                    String(attrset.get("name").unwrap())
+                                    String(ref attrset.get("name").unwrap())
                                 );
                                 let value = attrset.get("value").unwrap();
                                 (Rc::unwrap_or_clone(name), value.clone())
@@ -1481,9 +1486,9 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "getAttr".to_string(),
                 UnpackedValue::new_function(|name| {
-                    let name = extract_typed!("getAttr", String(name));
+                    let name = extract_typed!("getAttr", String(move  name));
                     UnpackedValue::new_function(move |attrset| {
-                        let attrset = extract_typed!("getAttr", Attrset(attrset));
+                        let attrset = extract_typed!("getAttr", Attrset(move attrset));
                         attrset.get(name.as_str()).unwrap().clone()
                     })
                     .pack()
@@ -1494,9 +1499,9 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "hasAttr".to_string(),
                 UnpackedValue::new_function(|name| {
-                    let name = extract_typed!("hasAttr", String(name));
+                    let name = extract_typed!("hasAttr", String(move name));
                     UnpackedValue::new_function(move |attrset| {
-                        let attrset = extract_typed!("hasAttr", Attrset(attrset));
+                        let attrset = extract_typed!("hasAttr", Attrset(move attrset));
                         UnpackedValue::Bool(attrset.contains_key(name.as_str())).pack()
                     })
                     .pack()
@@ -1507,9 +1512,9 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "intersectAttrs".to_string(),
                 UnpackedValue::new_function(|e1| {
-                    let e1 = extract_typed!("intersectAttrs", Attrset(e1));
+                    let e1 = extract_typed!("intersectAttrs", Attrset(move e1));
                     UnpackedValue::new_function(move |e2| {
-                        let e2 = extract_typed!("intersectAttrs", Attrset(e2));
+                        let e2 = extract_typed!("intersectAttrs", Attrset(move e2));
                         UnpackedValue::new_attrset(if e2.len() > e1.len() {
                             e1.keys()
                                 .filter_map(|key| {
@@ -1532,11 +1537,11 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "removeAttrs".to_string(),
                 UnpackedValue::new_function(|attrs| {
-                    let attrs = extract_typed!("removeAttrs", Attrset(attrs));
+                    let attrs = extract_typed!("removeAttrs", Attrset(move attrs));
                     UnpackedValue::new_function(move |names| {
-                        let names = extract_typed!("removeAttrs", List(names))
+                        let names = extract_typed!("removeAttrs", List(move names))
                             .iter()
-                            .map(|value| extract_typed!("removeAttrs", String(value)))
+                            .map(|value| extract_typed!("removeAttrs", String(ref value)))
                             .collect::<HashSet<_>>();
                         UnpackedValue::new_attrset(
                             attrs
@@ -1557,11 +1562,11 @@ fn create_root_scope() -> *mut Scope {
                 UnpackedValue::new_function(|mapper| {
                     UnpackedValue::new_function(move |sets| {
                         UnpackedValue::new_attrset(
-                            extract_typed!("zipAttrsWith", List(sets))
+                            extract_typed!("zipAttrsWith", List(move sets))
                                 .iter()
                                 .fold(HashMap::<String, Vec<Value>>::new(), |mut acc, value| {
                                     for (key, value) in
-                                        extract_typed!("zipAttrsWith", Attrset(value))
+                                        extract_typed!("zipAttrsWith", Attrset(ref value))
                                     {
                                         acc.entry(key.to_string())
                                             .or_default()
@@ -1593,7 +1598,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "getEnv".to_string(),
                 UnpackedValue::new_function(|name| {
-                    let name = extract_typed!("getEnv", String(name));
+                    let name = extract_typed!("getEnv", String(move name));
                     UnpackedValue::new_string(match std::env::var(name.as_str()) {
                         Ok(value) => value,
                         Err(VarError::NotPresent) => String::new(),
@@ -1607,7 +1612,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "attrNames".to_string(),
                 UnpackedValue::new_function(|attrset| {
-                    let attrset = extract_typed!("attrNames", Attrset(attrset));
+                    let attrset = extract_typed!("attrNames", Attrset(move attrset));
 
                     UnpackedValue::new_list(
                         attrset
@@ -1625,7 +1630,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "attrValues".to_string(),
                 UnpackedValue::new_function(|attrset| {
-                    let attrset = extract_typed!("attrValues", Attrset(attrset));
+                    let attrset = extract_typed!("attrValues", Attrset(move attrset));
 
                     UnpackedValue::new_list(attrset.values().cloned().collect()).pack()
                 })
@@ -1635,13 +1640,13 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "catAttrs".to_string(),
                 UnpackedValue::new_function(|name| {
-                    let name = extract_typed!("catAttrs", String(name));
+                    let name = extract_typed!("catAttrs", String(move name));
 
                     UnpackedValue::new_function(move |attrlist| {
                         let mut result = vec![];
-                        let list = extract_typed!("catAttrs", List(attrlist));
+                        let list = extract_typed!("catAttrs", List(move attrlist));
                         for value in list.iter() {
-                            let attrset = extract_typed!("catAttrs", Attrset(value));
+                            let attrset = extract_typed!("catAttrs", Attrset(ref value));
                             if let Some(value) = attrset.get(name.as_str()) {
                                 result.push(value.clone());
                             }
@@ -1658,11 +1663,11 @@ fn create_root_scope() -> *mut Scope {
                 UnpackedValue::new_function(|f| {
                     UnpackedValue::new_function(move |list| {
                         let mut result = BTreeMap::new();
-                        let list = extract_typed!("groupBy", List(list));
+                        let list = extract_typed!("groupBy", List(move list));
                         for value in list.iter() {
                             let key = extract_typed!(
                                 "groupBy",
-                                String(call_value!("groupBy", f.clone(), value.clone()))
+                                String(move call_value!("groupBy", f.clone(), value.clone()))
                             );
                             result
                                 .entry(Rc::unwrap_or_clone(key))
@@ -1725,7 +1730,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "length".to_string(),
                 UnpackedValue::new_function(|list| {
-                    let list = extract_typed!("length", List(list));
+                    let list = extract_typed!("length", List(move list));
                     UnpackedValue::Integer(list.len() as i32).pack()
                 })
                 .pack(),
@@ -1738,7 +1743,7 @@ fn create_root_scope() -> *mut Scope {
                         let op = op.clone();
                         UnpackedValue::new_function(move |list| {
                             let mut acc = nul.clone();
-                            let list = extract_typed!("foldl'", List(list));
+                            let list = extract_typed!("foldl'", List(move list));
                             for value in list.iter() {
                                 acc = call_value!("foldl'", op.clone(), acc, value.clone());
                             }
@@ -1752,9 +1757,9 @@ fn create_root_scope() -> *mut Scope {
                 "partition".to_string(),
                 UnpackedValue::new_function(|pred| {
                     UnpackedValue::new_function(move |list| {
-                        let list = extract_typed!("partition", List(list));
+                        let list = extract_typed!("partition", List(move list));
                         let (right, wrong) = list.iter().cloned().partition(|value|
-                            extract_typed!("partition", Bool(call_value!("partition", pred.clone(), value.clone()))
+                            extract_typed!("partition", Bool(move call_value!("partition", pred.clone(), value.clone()))
                             ));
                         UnpackedValue::new_attrset({
                             let mut result = ValueMap::new();
@@ -1782,11 +1787,11 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "concatLists".to_string(),
                 UnpackedValue::new_function(|lists| {
-                    let lists = extract_typed!("concatLists", List(lists));
+                    let lists = extract_typed!("concatLists", List(move lists));
                     UnpackedValue::new_list(
                         lists
                             .iter()
-                            .flat_map(|list| extract_typed!("concatLists", List(list)).iter())
+                            .flat_map(|list| extract_typed!("concatLists", List(ref list)).iter())
                             .cloned()
                             .collect(),
                     )
@@ -1799,11 +1804,11 @@ fn create_root_scope() -> *mut Scope {
                 "concatMap".to_string(),
                 UnpackedValue::new_function(|mapper| {
                     UnpackedValue::new_function(move |lists| {
-                        let lists = extract_typed!("concatMap", List(lists));
+                        let lists = extract_typed!("concatMap", List(move lists));
                         UnpackedValue::new_list(
                             lists
                                 .iter()
-                                .flat_map(|list| extract_typed!("concatLists", List(list)).iter())
+                                .flat_map(|list| extract_typed!("concatLists", List(ref list)).iter())
                                 .cloned()
                                 .map(|value| call_value!("concatMap", mapper.clone(), value))
                                 .collect(),
@@ -1818,20 +1823,20 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "concatStringsSep".to_string(),
                 UnpackedValue::new_function(|sep| {
-                    let sep = extract_typed!("concatStringsSep", String(sep));
+                    let sep = extract_typed!("concatStringsSep", String(move sep));
                     UnpackedValue::new_function(move |strings| {
-                        let strings = extract_typed!("concatStringsSep", List(strings));
+                        let strings = extract_typed!("concatStringsSep", List(move strings));
                         UnpackedValue::new_string({
                             let mut result = String::new();
                             let mut it = strings.iter();
                             if let Some(first) = it.next() {
                                 result +=
-                                    extract_typed!("concatStringsSep", String(first)).as_str();
+                                    extract_typed!("concatStringsSep", String(ref first)).as_str();
                             }
                             for string in it {
                                 result += sep.as_str();
                                 result +=
-                                    extract_typed!("concatStringsSep", String(string)).as_str();
+                                    extract_typed!("concatStringsSep", String(ref string)).as_str();
                             }
                             result
                         })
@@ -1845,7 +1850,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "stringLength".to_string(),
                 UnpackedValue::new_function(|string| {
-                    let string = extract_typed!("stringLength", String(string));
+                    let string = extract_typed!("stringLength", String(move string));
                     UnpackedValue::Integer(string.len() as i32).pack()
                 })
                 .pack(),
@@ -1857,9 +1862,9 @@ fn create_root_scope() -> *mut Scope {
                     UnpackedValue::new_function(move |len| {
                         let start = start.clone();
                         UnpackedValue::new_function(move |string| {
-                            let start = extract_typed!("substring", Integer(start)) as usize;
-                            let len = extract_typed!("substring", Integer(len));
-                            let string = extract_typed!("substring", String(string));
+                            let start = extract_typed!("substring", Integer(ref start)) as usize;
+                            let len = extract_typed!("substring", Integer(ref len));
+                            let string = extract_typed!("substring", String(move string));
 
                             UnpackedValue::new_string(if start >= string.len() {
                                 String::new()
@@ -1883,18 +1888,18 @@ fn create_root_scope() -> *mut Scope {
                     UnpackedValue::new_function(move |to| {
                         let from = from.clone();
                         UnpackedValue::new_function(move |s| {
-                            let from = extract_typed!("replaceStrings", List(from));
-                            let to = extract_typed!("replaceStrings", List(to));
-                            let s = extract_typed!("replaceStrings", String(s));
+                            let from = extract_typed!("replaceStrings", List(ref from));
+                            let to = extract_typed!("replaceStrings", List(ref to));
+                            let s = extract_typed!("replaceStrings", String(move s));
                             let mut result = Rc::unwrap_or_clone(s);
 
                             for (i, pattern) in from.iter().enumerate() {
-                                let pattern = extract_typed!("replaceStrings", String(pattern));
+                                let pattern = extract_typed!("replaceStrings", String(ref pattern));
                                 // FIXME: make this actually efficient
                                 if result.contains(pattern.as_str()) {
                                     result = result.replace(
                                         pattern.as_str(),
-                                        extract_typed!("replaceStrings", String(to[i])).as_str(),
+                                        extract_typed!("replaceStrings", String(ref to[i])).as_str(),
                                     );
                                 }
                             }
@@ -1911,9 +1916,9 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "match".to_string(),
                 UnpackedValue::new_function(|regex| {
-                    let regex = Regex::new(extract_typed!("match", String(regex)).as_str()).unwrap();
+                    let regex = Regex::new(extract_typed!("match", String(move regex)).as_str()).unwrap();
                     UnpackedValue::new_function(move |string| {
-                        let string = extract_typed!("match", String(string));
+                        let string = extract_typed!("match", String(move string));
                         regex.is_match(string.as_str()).into()
                     }).pack()
                 }).pack()
@@ -1922,7 +1927,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "pathExists".to_string(),
                 UnpackedValue::new_function(|path| {
-                    let path = extract_typed!("pathExists", Path(path));
+                    let path = extract_typed!("pathExists", Path(move path));
                     UnpackedValue::Bool(
                         path.try_exists().unwrap()
                     )
@@ -1934,7 +1939,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "readFile".to_string(),
                 UnpackedValue::new_function(|path| {
-                    let path = extract_typed!("readFile", Path(path));
+                    let path = extract_typed!("readFile", Path(move path));
                     UnpackedValue::new_string(
                         std::fs::read_to_string(&*path).unwrap()
                     )
@@ -1946,7 +1951,7 @@ fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 "readFileType".to_string(),
                 UnpackedValue::new_function(|path| {
-                    let path = extract_typed!("readFileType", Path(path));
+                    let path = extract_typed!("readFileType", Path(move path));
                     let file_type = path.metadata().unwrap().file_type();
                     UnpackedValue::new_string(
                         if file_type.is_dir() {
@@ -1970,7 +1975,7 @@ fn create_root_scope() -> *mut Scope {
                 UnpackedValue::new_function(|generator| {
                     UnpackedValue::new_function(move |length| {
                         let mut result = vec![];
-                        for i in 0..extract_typed!("genList", Integer(length)) {
+                        for i in 0..extract_typed!("genList", Integer(move length)) {
                             result.push(call_value!(
                                 "genList",
                                 generator.clone(),
@@ -2015,7 +2020,7 @@ fn create_root_scope() -> *mut Scope {
     values.insert(
         "import".to_string(),
         UnpackedValue::new_function(|value| {
-            let path = extract_typed!("import", Path(value));
+            let path = extract_typed!("import", Path(move value));
             import(&path)
         })
         .pack(),
