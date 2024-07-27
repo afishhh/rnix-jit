@@ -1267,9 +1267,20 @@ fn create_root_scope() -> *mut Scope {
     })
     .pack();
 
+    let throw_function = UnpackedValue::new_function(|message| {
+        let message = extract_typed!("throw", String(move message));
+        let exception = _Unwind_Exception::new(NIX_EXCEPTION_CLASS, nix_exception_cleanup);
+        println!("builtins.throw {message}");
+        let result = unsafe { _Unwind_RaiseException(&exception as *const _Unwind_Exception) };
+        eprintln!("_Unwind_RaiseException failed: {result:?}");
+        std::process::abort();
+    })
+    .pack();
+
     // TODO: Why is this also in the top-level scope? Backwards compatibility?
     values.insert("map".to_string(), map_function.clone());
     values.insert("toString".to_string(), to_string_function.clone());
+    values.insert("throw".to_string(), throw_function.clone());
 
     values.insert(
         "builtins".to_string(),
@@ -1277,8 +1288,8 @@ fn create_root_scope() -> *mut Scope {
             let mut builtins = ValueMap::new();
 
             builtins.insert("map".to_string(), map_function);
-
             builtins.insert("toString".to_string(), to_string_function);
+            builtins.insert("throw".to_string(), throw_function);
 
             builtins.insert(
                 "filter".to_string(),
@@ -2048,16 +2059,6 @@ fn create_root_scope() -> *mut Scope {
         UnpackedValue::new_function(|value: Value| {
             println!("trace (shallow): {value:?}");
             UnpackedValue::new_function(|value| value).pack()
-        })
-        .pack(),
-    );
-    values.insert(
-        "__panic".to_string(),
-        UnpackedValue::new_function(|_value: Value| {
-            let exception = _Unwind_Exception::new(NIX_EXCEPTION_CLASS, nix_exception_cleanup);
-            let result = unsafe { _Unwind_RaiseException(&exception as *const _Unwind_Exception) };
-            eprintln!("_Unwind_RaiseException: {result:?}");
-            std::process::abort();
         })
         .pack(),
     );
