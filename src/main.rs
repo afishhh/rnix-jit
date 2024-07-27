@@ -1877,7 +1877,7 @@ fn create_root_scope() -> *mut Scope {
                             } else if len == -1 {
                                 string[start..].to_string()
                             } else {
-                                string[start..(start + len as usize)].to_string()
+                                string[start..std::cmp::min(start + len as usize, string.len())].to_string()
                             })
                             .pack()
                         })
