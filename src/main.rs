@@ -31,7 +31,7 @@ enum Operation {
     CreateAttrset { rec: bool },
     InheritAttrs(Option<Program>, Vec<String>),
     SetAttrpath(usize, Program),
-    GetAttrConsume,
+    GetAttrConsume { default: Option<Program> },
     HasAttrpath(usize),
     PushList,
     ListAppend(Program),
@@ -147,11 +147,9 @@ fn build_string<Content>(
         )),
         Some(InterpolPart::Interpolation(interpol)) => {
             build_program(here, interpol.expr().unwrap(), program);
-            // The appended-to string in StringMutAppend is assumed to already be a
-            // String value, therefore it has to be unlazy-ied in the interpolated case
-            program.operations.push(Operation::StringCloneToMut)
         }
     }
+    program.operations.push(Operation::StringCloneToMut);
     for part in parts {
         match part {
             InterpolPart::Literal(literal) => program.operations.push(Operation::Push(
@@ -192,7 +190,9 @@ fn build_program(here: &Path, expr: Expr, program: &mut Program) {
                 program.operations.push(Operation::Push(
                     UnpackedValue::new_string(attr.to_string()).pack(),
                 ));
-                program.operations.push(Operation::GetAttrConsume)
+                program.operations.push(Operation::GetAttrConsume {
+                    default: x.default_expr().map(|expr| create_program(here, expr)),
+                })
             }
         }
         Expr::Str(x) => build_string(here, x.normalized_parts(), |x| x, false, program),
@@ -503,12 +503,12 @@ fn create_eh_frame(
     // FDEs
     {
         for (i, fde) in fdes.into_iter().enumerate() {
-            println!("fde {i} starts at address offset {}", data.len());
+            // eprintln!("fde {i} starts at address offset {}", data.len());
             let fde_start = data.len();
             // length
             data.extend([0u8; 4]);
             // CIE_pointer
-            data.extend(dbg!(data.len() as u32).to_le_bytes());
+            data.extend((data.len() as u32).to_le_bytes());
             // initial_location
             data.extend(fde.initial_location.to_le_bytes());
             // address_range
@@ -518,9 +518,9 @@ fn create_eh_frame(
             // call frame instructions
             let fde_program_start = data.len();
             fde_instruction_builder(i, &fde, &mut data);
-            eprintln!("program for fde {i} is {:?}", &data[fde_program_start..]);
+            // eprintln!("program for fde {i} is {:?}", &data[fde_program_start..]);
             dwarf_align(&mut data, fde_start);
-            eprintln!("fde {:?}", &data[fde_start..])
+            // eprintln!("fde {:?}", &data[fde_start..])
         }
     }
 
@@ -730,6 +730,12 @@ impl From<bool> for UnpackedValue {
 impl From<String> for UnpackedValue {
     fn from(value: String) -> Self {
         UnpackedValue::new_string(value)
+    }
+}
+
+impl From<LazyValue> for UnpackedValue {
+    fn from(value: LazyValue) -> Self {
+        UnpackedValue::Lazy(value)
     }
 }
 
@@ -1403,7 +1409,7 @@ fn create_root_scope() -> *mut Scope {
                         #[allow(clippy::redundant_closure)]
                         // NOTE: It doesn't seem like Value::and implements FnMut?
                         list.iter()
-                            .map(|element| unsafe {
+                            .map(|element| {
                                 call_value!("all", predicate.clone(), element.clone())
                             })
                             .reduce(|a, b| Value::and(a, b))

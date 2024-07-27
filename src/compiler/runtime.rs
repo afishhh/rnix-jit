@@ -38,30 +38,32 @@ pub unsafe extern "C" fn create_function_scope(
             let UnpackedValue::Attrset(heapvalue) = value.unpack() else {
                 panic!("cannot unpack non-attrset value in pattern parameter");
             };
-            let mut scope = ValueMap::new();
+            let scope = Scope::from_map(ValueMap::new(), previous);
+            let mut scope_map = &mut *((*scope).values as *mut ValueMap);
             let mut found_keys = 0;
             for (key, default) in entries.iter() {
                 let value = (*heapvalue.get()).get(key);
                 found_keys += value.is_some() as usize;
-                let Some(value) = value
-                    .cloned()
-                    .or_else(|| default.as_ref().map(|x| x.run(previous, &Value::NULL)))
-                else {
+                let Some(value) = value.cloned().or_else(|| {
+                    default
+                        .as_ref()
+                        .map(|x| LazyValue::from_jit(scope, x.clone()).into())
+                }) else {
                     panic!("missing pattern entry");
                 };
-                scope.insert(key.to_string(), value);
+                scope_map.insert(key.to_string(), value);
             }
             if !ignore_unmatched {
                 assert_eq!(found_keys, (*heapvalue.get()).len());
             }
             if let Some(binding) = binding {
-                scope.insert(binding.to_string(), value);
+                scope_map.insert(binding.to_string(), value);
             }
             // scope.get("hello");
             let mut s = String::new();
-            UnpackedValue::fmt_attrset_display(&scope, 0, &mut s, true).unwrap();
+            UnpackedValue::fmt_attrset_display(scope_map, 0, &mut s, true).unwrap();
             // println!("{s}");
-            Scope::from_map(scope, previous)
+            scope
         }
     }
 }
@@ -171,13 +173,26 @@ pub unsafe extern "C" fn attrset_inherit_parent(
     }
 }
 
-pub unsafe extern "C" fn attrset_get(map: &mut ValueMap, name: Value) -> Value {
+pub unsafe extern "C" fn attrset_get(
+    map: &mut ValueMap,
+    name: Value,
+    scope: *mut Scope,
+    fallback: *const Executable,
+) -> Value {
     let UnpackedValue::String(name) = name.into_unpacked() else {
         panic!("GetAttr called with non-string name")
     };
-    map.get(name.as_str())
-        .unwrap_or_else(|| panic!("{map:?}.{name:?} doesn't exist"))
-        .clone()
+    map.get(name.as_str()).cloned().unwrap_or_else(|| {
+        if fallback.is_null() {
+            panic!("{map:?}.{name:?} does not exist")
+        } else {
+            LazyValue::from_jit(scope, unsafe {
+                Rc::increment_strong_count(fallback);
+                Rc::from_raw(fallback)
+            })
+        }
+        .into()
+    })
 }
 
 pub unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Value) -> Value {
@@ -309,4 +324,13 @@ pub unsafe extern "C" fn value_string_to_path(a: Value) -> Value {
 
 pub unsafe extern "C" fn asm_panic(msg: *const i8) {
     panic!("[JITPANIC] {}", CStr::from_ptr(msg).to_string_lossy());
+}
+
+pub unsafe extern "C-unwind" fn asm_panic_with_value(msg: *const i8, value: Value) {
+    println!("[JITPANIC] {}", CStr::from_ptr(msg).to_string_lossy());
+    println!(
+        "[JITPANIC] Value passed to asm_panic_with_value: {} {value:?}",
+        value.0
+    );
+    panic!("jitpanic")
 }

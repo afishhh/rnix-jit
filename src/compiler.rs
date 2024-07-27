@@ -15,7 +15,7 @@ use runtime::*;
 pub enum CompiledParameter {
     Ident(String),
     Pattern {
-        entries: Vec<(String, Option<Executable>)>,
+        entries: Vec<(String, Option<Rc<Executable>>)>,
         binding: Option<String>,
         ignore_unmatched: bool,
     },
@@ -129,9 +129,11 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                 entries: entries
                     .into_iter()
                     .map(|(name, default)| {
-                        Ok::<(String, Option<Executable>), IcedError>((
+                        Ok::<(String, Option<Rc<Executable>>), IcedError>((
                             name,
-                            default.map(|program| compile(program, None)).transpose()?,
+                            default
+                                .map(|program| compile(program, None).map(Rc::new))
+                                .transpose()?,
                         ))
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -531,7 +533,11 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
 
                         asm.set_label(&mut end)?;
                     }
-                    Operation::GetAttrConsume => {
+                    Operation::GetAttrConsume { default } => {
+                        let default = if let Some(program) = default {
+                            closure.intern(compile(program, None)?)
+                        } else { std::ptr::null() };
+
                         assert!(stack_values >= 2);
                         asm.pop(r12)?;
                         stack_values -= 1;
@@ -548,6 +554,9 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         asm.jne(not_an_attrset)?;
 
                         asm.sub(rdi, ValueKind::Attrset as i32)?;
+
+                        asm.mov(rdx, r15)?;
+                        asm.mov(rcx, default as u64)?;
 
                         call!(rust attrset_get);
                         asm.push(rax)?;
@@ -971,30 +980,33 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
             panic!("mprotect failed");
         }
 
+        // FIXME: still broken
         #[allow(unused_assignments)]
         let frame = create_eh_frame(
             [Fde {
                 initial_location: code_mem as u64,
-                address_range: dbg!(code.len()) as u64,
+                address_range: code.len() as u64,
             }],
+            1,
+            -8,
             // TODO: The CIE could be shared
             |cie| {
                 DW_CFA_advance_loc(
                     cie,
-                    dbg!(result.new_instruction_offsets[function_enter_ins]) as u8,
+                    result.new_instruction_offsets[function_enter_ins] as u8,
                 );
-                DW_CFA_offset(cie, 16, (-8i64) as u64);
+                DW_CFA_offset(cie, 16, 1);
                 DW_CFA_offset(cie, 14, 0);
-                DW_CFA_offset(cie, 13, 8);
-                DW_CFA_offset(cie, 12, 16);
-                DW_CFA_offset(cie, 3, 24);
+                DW_CFA_offset(cie, 13, (-1i64) as u64);
+                DW_CFA_offset(cie, 12, (-2i64) as u64);
+                DW_CFA_offset(cie, 3, (-3i64) as u64);
             },
             |_index, _fde, out: &mut Vec<u8>| {
                 let mut ip = 0u64;
                 macro_rules! advance_to {
                     ($fun: ident[$width: ident], $x: expr) => {{
                         let _x: u64 = $x;
-                        let advance = dbg!(_x - ip);
+                        let advance = _x - ip;
                         $fun(out, advance as $width);
                         ip += advance;
                     }};
@@ -1002,23 +1014,23 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
 
                 advance_to!(
                     DW_CFA_advance_loc[u8],
-                    dbg!(result.new_instruction_offsets[function_enter_ins]).into()
+                    result.new_instruction_offsets[function_enter_ins].into()
                 );
                 DW_CFA_def_cfa(out, /* rbp */ 6, 16);
                 advance_to!(
                     DW_CFA_advance_loc4[u32],
-                    dbg!(result.new_instruction_offsets[function_leave_ins]).into()
+                    result.new_instruction_offsets[function_leave_ins].into()
                 );
                 DW_CFA_def_cfa(out, /* rsp */ 7, 8);
             },
         )
         .into_boxed_slice();
-        println!("{:?}", frame.as_ptr());
+        // println!("{:?}", frame.as_ptr());
         // walk_eh_frame_fdes(&frame[..], |offset| {
         //     println!("registering fde at offset {offset}");
         //     __register_frame(frame.as_ptr().add(offset));
         // });
-        dbg!(__register_frame(frame.as_ptr()));
+        // dbg!(__register_frame(frame.as_ptr()));
 
         Ok(Executable {
             _closure: closure,
