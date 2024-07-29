@@ -39,7 +39,7 @@ pub unsafe extern "C-unwind" fn create_function_scope(
                 panic!("cannot unpack non-attrset value in pattern parameter");
             };
             let scope = Scope::from_map(ValueMap::new(), previous);
-            let mut scope_map = &mut *((*scope).values as *mut ValueMap);
+            let scope_map = &mut *((*scope).values as *mut ValueMap);
             let mut found_keys = 0;
             for (key, default) in entries.iter() {
                 let value = (*heapvalue.get()).get(key);
@@ -86,17 +86,20 @@ pub unsafe extern "C" fn scope_set(
     value: *const Executable,
 ) {
     let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(key, key_len));
-    Rc::increment_strong_count(value);
     match &mut (*scope).storage {
         ScopeStorage::Attrset => panic!("scope_set called on Attrset Scope"),
         ScopeStorage::Scope(values) => values.insert(
             name.to_string(),
-            UnpackedValue::Lazy(LazyValue::from_jit(scope, Rc::from_raw(value))).pack(),
+            UnpackedValue::Lazy(LazyValue::from_jit(scope, {
+                Rc::increment_strong_count(value);
+                Rc::from_raw(value)
+            }))
+            .pack(),
         ),
     };
 }
 
-pub unsafe extern "C" fn map_inherit_from(
+pub unsafe extern "C-unwind" fn map_inherit_from(
     scope: *mut Scope,
     map: &mut ValueMap,
     from: *const Executable,
@@ -106,8 +109,10 @@ pub unsafe extern "C" fn map_inherit_from(
     let what = std::slice::from_raw_parts(what, whatn);
 
     for key in what {
-        Rc::increment_strong_count(from);
-        let from = Rc::from_raw(from);
+        let from = {
+            Rc::increment_strong_count(from);
+            Rc::from_raw(from)
+        };
         map.insert(
             key.to_string(),
             UnpackedValue::Lazy(LazyValue::from_closure(move || {
@@ -125,7 +130,7 @@ pub unsafe extern "C" fn map_inherit_from(
     }
 }
 
-pub unsafe extern "C" fn scope_inherit_parent(
+pub unsafe extern "C-unwind" fn scope_inherit_parent(
     scope: *mut Scope,
     from: *mut Scope,
     what: *const String,
@@ -145,7 +150,7 @@ pub unsafe extern "C" fn attrset_create() -> Value {
     UnpackedValue::new_attrset(ValueMap::new()).pack()
 }
 
-pub unsafe extern "C" fn attrset_set(
+pub unsafe extern "C-unwind" fn attrset_set(
     map: &mut ValueMap,
     scope: *mut Scope,
     value: *const Executable,
@@ -154,10 +159,14 @@ pub unsafe extern "C" fn attrset_set(
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("SetAttr called with non-string name")
     };
-    Rc::increment_strong_count(value);
     map.insert(
         Rc::unwrap_or_clone(name),
-        UnpackedValue::Lazy(LazyValue::from_jit(scope, Rc::from_raw(value))).pack(),
+        UnpackedValue::Lazy(LazyValue::from_jit(scope, {
+            println!("value: {:?}", value);
+            Rc::increment_strong_count(value);
+            Rc::from_raw(value)
+        }))
+        .pack(),
     );
 }
 
@@ -173,7 +182,7 @@ pub unsafe extern "C" fn attrset_inherit_parent(
     }
 }
 
-pub unsafe extern "C" fn attrset_get(
+pub unsafe extern "C-unwind" fn attrset_get(
     map: &mut ValueMap,
     name: Value,
     scope: *mut Scope,
@@ -195,7 +204,7 @@ pub unsafe extern "C" fn attrset_get(
     })
 }
 
-pub unsafe extern "C" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Value) -> Value {
+pub unsafe extern "C-unwind" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Value) -> Value {
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("GetAttr called with non-string name")
     };
@@ -240,10 +249,12 @@ pub unsafe extern "C" fn create_function_value(
     executable: *const Executable,
     scope: *mut Scope,
 ) -> Value {
-    Rc::increment_strong_count(executable);
     UnpackedValue::Function(Rc::new(Function {
         call: (*executable).code(),
-        _executable: Some(Rc::from_raw(executable)),
+        _executable: Some({
+            Rc::increment_strong_count(executable);
+            Rc::from_raw(executable)
+        }),
         builtin_closure: None,
         parent_scope: scope,
     }))
@@ -259,10 +270,13 @@ pub unsafe extern "C" fn list_append_value(
     scope: *mut Scope,
     executable: *const Executable,
 ) {
-    unsafe {
-        Rc::increment_strong_count(executable);
-        list.push(UnpackedValue::Lazy(LazyValue::from_jit(scope, Rc::from_raw(executable))).pack());
-    }
+    list.push(
+        UnpackedValue::Lazy(LazyValue::from_jit(scope, unsafe {
+            Rc::increment_strong_count(executable);
+            Rc::from_raw(executable)
+        }))
+        .pack(),
+    );
 }
 
 pub unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
@@ -286,7 +300,7 @@ pub unsafe extern "C" fn string_mut_append(from: NonNull<String>, to: &mut Strin
     Rc::decrement_strong_count(from.as_ptr());
 }
 
-pub unsafe extern "C" fn value_into_evaluated(a: Value) -> Value {
+pub unsafe extern "C-unwind" fn value_into_evaluated(a: Value) -> Value {
     a.into_evaluated()
 }
 
@@ -294,7 +308,7 @@ pub unsafe extern "C" fn value_ref(a: ManuallyDrop<Value>) -> Value {
     a.deref().clone()
 }
 
-pub unsafe extern "C" fn value_string_to_mut(a: Value) -> Value {
+pub unsafe extern "C-unwind" fn value_string_to_mut(a: Value) -> Value {
     macro_rules! clonerc {
         ($x: expr) => {
             if Rc::strong_count(&$x) > 1 {

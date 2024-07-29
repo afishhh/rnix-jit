@@ -8,20 +8,31 @@
 
 use core::panic;
 use std::{
-    cell::UnsafeCell,
-    collections::{BTreeMap, HashMap, HashSet},
-    env::VarError,
-    fmt::{Debug, Display, Write},
-    mem::{offset_of, MaybeUninit},
-    ops::Deref,
-    path::{Path, PathBuf},
-    rc::Rc,
+    arch::{asm, global_asm}, cell::UnsafeCell, collections::{BTreeMap, HashMap, HashSet}, env::VarError, fmt::{Debug, Display, Write}, mem::{offset_of, MaybeUninit}, ops::Deref, path::PathBuf, rc::Rc
 };
 
-use compiler::Executable;
+use compiler::{Compiler, Executable};
 use dwarf::*;
 use regex::Regex;
-use rnix::ast::{AstToken, Attr, Attrpath, Expr, HasEntry, InterpolPart};
+use rnix::{
+    ast::{AstToken, Attr, Attrpath, Expr, HasEntry, InterpolPart},
+    TextRange,
+};
+use rowan::ast::AstNode; // NOTE: Importing this from rowan works but not from rnix...
+
+#[derive(Debug)]
+struct SourceFile {
+    filename: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourceSpan {
+    // TODO: this doesn't have to be stored per-SourceSpan
+    //       (per-Executable instead?)
+    file: Rc<SourceFile>,
+    range: TextRange,
+}
 
 #[derive(Debug)]
 enum Operation {
@@ -65,6 +76,8 @@ enum Operation {
     IfElse(Program, Program),
     Invert,
     Negate,
+    SourceSpanPush(SourceSpan),
+    SourceSpanPop,
 }
 
 #[derive(Debug)]
@@ -72,18 +85,9 @@ struct Program {
     operations: Vec<Operation>,
 }
 
-fn create_program(here: &Path, expr: Expr) -> Program {
-    let mut program = Program::new();
-    build_program(here, expr, &mut program);
-    program
-}
-
-fn attr_assert_const(attr: Attr) -> String {
-    match attr {
-        Attr::Ident(x) => x.ident_token().unwrap().green().text().to_string(),
-        Attr::Dynamic(_) => todo!(),
-        Attr::Str(_) => todo!(),
-    }
+struct IRCompiler {
+    working_directory: PathBuf,
+    source_file: Rc<SourceFile>,
 }
 
 // TODO: Notes on building attrsets
@@ -99,233 +103,274 @@ fn attr_assert_const(attr: Attr) -> String {
 // attribute set which would then be filled with values and possible dynamic attributes.
 // I believe this would improve attrset building performance during runtime pretty significantly
 
-fn build_attrpath(here: &Path, attrpath: Attrpath, program: &mut Program) -> usize {
-    let mut n = 0;
-    for attr in attrpath.attrs().collect::<Vec<_>>().into_iter().rev() {
-        match attr {
-            Attr::Ident(x) => program.operations.push(Operation::Push(
-                UnpackedValue::new_string(x.ident_token().unwrap().green().text().to_string())
-                    .pack(),
-            )),
-            Attr::Dynamic(x) => build_program(here, x.expr().unwrap(), program),
-            Attr::Str(x) => build_string(here, x.normalized_parts(), |x| x, false, program),
-        };
-        n += 1;
+fn attr_assert_const(attr: Attr) -> String {
+    match attr {
+        Attr::Ident(x) => x.ident_token().unwrap().green().text().to_string(),
+        Attr::Dynamic(_) => todo!(),
+        Attr::Str(_) => todo!(),
     }
-    n
 }
 
-fn build_string<Content>(
-    here: &Path,
-    parts: impl IntoIterator<Item = InterpolPart<Content>>,
-    content_to_text: impl Fn(&Content) -> &str,
-    is_path: bool,
-    program: &mut Program,
-) {
-    let mut parts = parts.into_iter();
-    match parts.next() {
-        None => {
-            return program.operations.push(Operation::Push(
-                UnpackedValue::new_string(String::new()).pack(),
-            ))
+impl IRCompiler {
+    fn create_program(&self, expr: Expr) -> Program {
+        let mut program = Program::new();
+        self.build_program(expr, &mut program);
+        program
+    }
+
+    fn build_attrpath(&self, attrpath: Attrpath, program: &mut Program) -> usize {
+        let mut n = 0;
+        for attr in attrpath.attrs().collect::<Vec<_>>().into_iter().rev() {
+            match attr {
+                Attr::Ident(x) => program.operations.push(Operation::Push(
+                    UnpackedValue::new_string(x.ident_token().unwrap().green().text().to_string())
+                        .pack(),
+                )),
+                Attr::Dynamic(x) => self.build_program(x.expr().unwrap(), program),
+                Attr::Str(x) => self.build_string(x.normalized_parts(), |x| x, false, program),
+            };
+            n += 1;
         }
-        Some(InterpolPart::Literal(literal)) => program.operations.push(Operation::Push(
-            UnpackedValue::new_string({
-                let literal = content_to_text(&literal).to_string();
-                if is_path {
-                    // not an absolute path
-                    if !literal.starts_with("/") && !here.as_os_str().is_empty() {
-                        format!("{}/{literal}", here.to_str().unwrap())
+        n
+    }
+
+    fn build_string<Content>(
+        &self,
+        parts: impl IntoIterator<Item = InterpolPart<Content>>,
+        content_to_text: impl Fn(&Content) -> &str,
+        is_path: bool,
+        program: &mut Program,
+    ) {
+        let mut parts = parts.into_iter();
+        match parts.next() {
+            None => {
+                return program.operations.push(Operation::Push(
+                    UnpackedValue::new_string(String::new()).pack(),
+                ))
+            }
+            Some(InterpolPart::Literal(literal)) => program.operations.push(Operation::Push(
+                UnpackedValue::new_string({
+                    let literal = content_to_text(&literal).to_string();
+                    if is_path {
+                        // not an absolute path
+                        if !literal.starts_with("/")
+                            && !self.working_directory.as_os_str().is_empty()
+                        {
+                            format!("{}/{literal}", self.working_directory.to_str().unwrap())
+                        } else {
+                            literal
+                        }
                     } else {
                         literal
                     }
-                } else {
-                    literal
-                }
-            })
-            .pack(),
-        )),
-        Some(InterpolPart::Interpolation(interpol)) => {
-            build_program(here, interpol.expr().unwrap(), program);
-        }
-    }
-    program.operations.push(Operation::StringCloneToMut);
-    for part in parts {
-        match part {
-            InterpolPart::Literal(literal) => program.operations.push(Operation::Push(
-                UnpackedValue::new_string(content_to_text(&literal).to_string()).pack(),
+                })
+                .pack(),
             )),
-            InterpolPart::Interpolation(interpol) => {
-                build_program(here, interpol.expr().unwrap(), program);
+            Some(InterpolPart::Interpolation(interpol)) => {
+                self.build_program(interpol.expr().unwrap(), program);
             }
         }
-        program.operations.push(Operation::StringMutAppend);
+        program.operations.push(Operation::StringCloneToMut);
+        for part in parts {
+            match part {
+                InterpolPart::Literal(literal) => program.operations.push(Operation::Push(
+                    UnpackedValue::new_string(content_to_text(&literal).to_string()).pack(),
+                )),
+                InterpolPart::Interpolation(interpol) => {
+                    self.build_program(interpol.expr().unwrap(), program);
+                }
+            }
+            program.operations.push(Operation::StringMutAppend);
+        }
+        if is_path {
+            program.operations.push(Operation::StringToPath);
+        }
     }
-    if is_path {
-        program.operations.push(Operation::StringToPath);
-    }
-}
 
-fn build_program(here: &Path, expr: Expr, program: &mut Program) {
-    match expr {
-        Expr::Apply(x) => {
-            build_program(here, x.argument().unwrap(), program);
-            build_program(here, x.lambda().unwrap(), program);
-            program.operations.push(Operation::Apply);
-        }
-        // TODO:
-        Expr::Assert(x) => build_program(here, x.body().unwrap(), program),
-        Expr::Error(_) => todo!(),
-        Expr::IfElse(x) => {
-            build_program(here, x.condition().unwrap(), program);
-            let if_true = create_program(here, x.body().unwrap());
-            let if_false = create_program(here, x.else_body().unwrap());
-            program
-                .operations
-                .push(Operation::IfElse(if_true, if_false))
-        }
-        Expr::Select(x) => {
-            build_program(here, x.expr().unwrap(), program);
-            for attr in x.attrpath().unwrap().attrs() {
-                program.operations.push(Operation::Push(
-                    UnpackedValue::new_string(attr.to_string()).pack(),
-                ));
-                program.operations.push(Operation::GetAttrConsume {
-                    default: x.default_expr().map(|expr| create_program(here, expr)),
+    fn build_program(&self, expr: Expr, program: &mut Program) {
+        program
+            .operations
+            .push(Operation::SourceSpanPush(SourceSpan {
+                file: self.source_file.clone(),
+                range: expr.syntax().text_range(),
+            }));
+        match expr {
+            Expr::Apply(x) => {
+                self.build_program(x.argument().unwrap(), program);
+                self.build_program(x.lambda().unwrap(), program);
+                program.operations.push(Operation::Apply);
+            }
+            // TODO:
+            Expr::Assert(x) => self.build_program(x.body().unwrap(), program),
+            Expr::Error(_) => todo!(),
+            Expr::IfElse(x) => {
+                self.build_program(x.condition().unwrap(), program);
+                let if_true = self.create_program(x.body().unwrap());
+                let if_false = self.create_program(x.else_body().unwrap());
+                program
+                    .operations
+                    .push(Operation::IfElse(if_true, if_false))
+            }
+            Expr::Select(x) => {
+                self.build_program(x.expr().unwrap(), program);
+                for attr in x.attrpath().unwrap().attrs() {
+                    program.operations.push(Operation::Push(
+                        UnpackedValue::new_string(attr.to_string()).pack(),
+                    ));
+                    program.operations.push(Operation::GetAttrConsume {
+                        default: x.default_expr().map(|expr| self.create_program(expr)),
+                    })
+                }
+            }
+            Expr::Str(x) => self.build_string(x.normalized_parts(), |x| x, false, program),
+            Expr::Path(x) => self.build_string(x.parts(), |x| x.syntax().text(), true, program),
+            Expr::Literal(x) => match x.kind() {
+                rnix::ast::LiteralKind::Float(_) => todo!(),
+                rnix::ast::LiteralKind::Integer(x) => {
+                    program.operations.push(Operation::Push(
+                        UnpackedValue::Integer(x.value().unwrap() as i32).pack(),
+                    ));
+                }
+                rnix::ast::LiteralKind::Uri(_) => todo!(),
+            },
+            Expr::Lambda(x) => {
+                let param = x.param().unwrap();
+                let param = match param {
+                    rnix::ast::Param::Pattern(pat) => Parameter::Pattern {
+                        entries: pat
+                            .pat_entries()
+                            .map(|x| {
+                                (
+                                    x.ident().unwrap().to_string(),
+                                    x.default().map(|x| self.create_program(x)),
+                                )
+                            })
+                            .collect(),
+                        binding: pat.pat_bind().map(|x| x.ident().unwrap().to_string()),
+                        ignore_unmatched: pat.ellipsis_token().is_some(),
+                    },
+                    rnix::ast::Param::IdentParam(ident) => {
+                        Parameter::Ident(ident.ident().unwrap().to_string())
+                    }
+                };
+                let body = x.body().unwrap();
+                program
+                    .operations
+                    .push(Operation::PushFunction(param, self.create_program(body)))
+            }
+            Expr::LegacyLet(_) => todo!(),
+            Expr::LetIn(x) => {
+                program.operations.push(Operation::ScopePush);
+                for inherit in x.inherits() {
+                    let source = inherit
+                        .from()
+                        .and_then(|f| f.expr())
+                        .map(|source| self.create_program(source));
+                    program.operations.push(Operation::ScopeInherit(
+                        source,
+                        inherit.attrs().map(attr_assert_const).collect(),
+                    ));
+                }
+                for entry in x.attrpath_values() {
+                    let mut it = entry.attrpath().unwrap().attrs();
+                    let name = attr_assert_const(it.next().unwrap());
+                    let value = entry.value().unwrap();
+                    let value_program = self.create_program(value);
+                    program
+                        .operations
+                        .push(Operation::ScopeSet(name, value_program));
+                }
+                self.build_program(x.body().unwrap(), program);
+                program.operations.push(Operation::ScopePop);
+            }
+            Expr::List(x) => {
+                program.operations.push(Operation::PushList);
+                for item in x.items() {
+                    let value_program = self.create_program(item);
+                    program
+                        .operations
+                        .push(Operation::ListAppend(value_program));
+                }
+            }
+            Expr::BinOp(x) => {
+                self.build_program(x.lhs().unwrap(), program);
+                self.build_program(x.rhs().unwrap(), program);
+                program.operations.push(match x.operator().unwrap() {
+                    rnix::ast::BinOpKind::Concat => Operation::Concat,
+                    rnix::ast::BinOpKind::Update => Operation::Update,
+                    rnix::ast::BinOpKind::Add => Operation::Add,
+                    rnix::ast::BinOpKind::Sub => Operation::Sub,
+                    rnix::ast::BinOpKind::Mul => Operation::Mul,
+                    rnix::ast::BinOpKind::Div => Operation::Div,
+                    rnix::ast::BinOpKind::And => Operation::And,
+                    rnix::ast::BinOpKind::Equal => Operation::Equal,
+                    rnix::ast::BinOpKind::Implication => Operation::Implication,
+                    rnix::ast::BinOpKind::Less => Operation::Less,
+                    rnix::ast::BinOpKind::LessOrEq => Operation::LessOrEqual,
+                    rnix::ast::BinOpKind::More => Operation::More,
+                    rnix::ast::BinOpKind::MoreOrEq => Operation::MoreOrEqual,
+                    rnix::ast::BinOpKind::NotEqual => Operation::NotEqual,
+                    rnix::ast::BinOpKind::Or => Operation::Or,
                 })
             }
-        }
-        Expr::Str(x) => build_string(here, x.normalized_parts(), |x| x, false, program),
-        Expr::Path(x) => build_string(here, x.parts(), |x| x.syntax().text(), true, program),
-        Expr::Literal(x) => match x.kind() {
-            rnix::ast::LiteralKind::Float(_) => todo!(),
-            rnix::ast::LiteralKind::Integer(x) => {
-                program.operations.push(Operation::Push(
-                    UnpackedValue::Integer(x.value().unwrap() as i32).pack(),
-                ));
-            }
-            rnix::ast::LiteralKind::Uri(_) => todo!(),
-        },
-        Expr::Lambda(x) => {
-            let param = x.param().unwrap();
-            let param = match param {
-                rnix::ast::Param::Pattern(pat) => Parameter::Pattern {
-                    entries: pat
-                        .pat_entries()
-                        .map(|x| {
-                            (
-                                x.ident().unwrap().to_string(),
-                                x.default().map(|x| create_program(here, x)),
-                            )
-                        })
-                        .collect(),
-                    binding: pat.pat_bind().map(|x| x.ident().unwrap().to_string()),
-                    ignore_unmatched: pat.ellipsis_token().is_some(),
-                },
-                rnix::ast::Param::IdentParam(ident) => {
-                    Parameter::Ident(ident.ident().unwrap().to_string())
+            Expr::Paren(x) => self.build_program(x.expr().unwrap(), program),
+            Expr::AttrSet(x) => {
+                program.operations.push(Operation::CreateAttrset {
+                    rec: x.rec_token().is_some(),
+                });
+                for inherit in x.inherits() {
+                    let source = inherit
+                        .from()
+                        .and_then(|f| f.expr())
+                        .map(|source| self.create_program(source));
+                    program.operations.push(Operation::InheritAttrs(
+                        source,
+                        inherit.attrs().map(attr_assert_const).collect(),
+                    ));
                 }
-            };
-            let body = x.body().unwrap();
-            program
-                .operations
-                .push(Operation::PushFunction(param, create_program(here, body)))
-        }
-        Expr::LegacyLet(_) => todo!(),
-        Expr::LetIn(x) => {
-            program.operations.push(Operation::ScopePush);
-            for inherit in x.inherits() {
-                let source = inherit
-                    .from()
-                    .and_then(|f| f.expr())
-                    .map(|source| create_program(here, source));
-                program.operations.push(Operation::ScopeInherit(
-                    source,
-                    inherit.attrs().map(attr_assert_const).collect(),
-                ));
+                for keyvalue in x.attrpath_values() {
+                    let path = keyvalue.attrpath().unwrap();
+                    let value = self.create_program(keyvalue.value().unwrap());
+                    let n = self.build_attrpath(path, program);
+                    program.operations.push(Operation::SetAttrpath(n, value));
+                }
             }
-            for entry in x.attrpath_values() {
-                let mut it = entry.attrpath().unwrap().attrs();
-                let name = attr_assert_const(it.next().unwrap());
-                let value = entry.value().unwrap();
-                let value_program = create_program(here, value);
-                program
-                    .operations
-                    .push(Operation::ScopeSet(name, value_program));
+            Expr::UnaryOp(x) => {
+                self.build_program(x.expr().unwrap(), program);
+                program.operations.push(match x.operator().unwrap() {
+                    rnix::ast::UnaryOpKind::Invert => Operation::Invert,
+                    rnix::ast::UnaryOpKind::Negate => Operation::Negate,
+                })
             }
-            build_program(here, x.body().unwrap(), program);
-            program.operations.push(Operation::ScopePop);
-        }
-        Expr::List(x) => {
-            program.operations.push(Operation::PushList);
-            for item in x.items() {
-                let value_program = create_program(here, item);
-                program
-                    .operations
-                    .push(Operation::ListAppend(value_program));
+            Expr::Ident(x) => program.operations.push(Operation::Load(
+                x.ident_token().unwrap().green().text().to_string(),
+            )),
+            Expr::With(_) => todo!(),
+            Expr::HasAttr(x) => {
+                self.build_program(x.expr().unwrap(), program);
+                let attrpath = x.attrpath().unwrap();
+                let n = self.build_attrpath(attrpath, program);
+                program.operations.push(Operation::HasAttrpath(n))
             }
+            _ => todo!(),
         }
-        Expr::BinOp(x) => {
-            build_program(here, x.lhs().unwrap(), program);
-            build_program(here, x.rhs().unwrap(), program);
-            program.operations.push(match x.operator().unwrap() {
-                rnix::ast::BinOpKind::Concat => Operation::Concat,
-                rnix::ast::BinOpKind::Update => Operation::Update,
-                rnix::ast::BinOpKind::Add => Operation::Add,
-                rnix::ast::BinOpKind::Sub => Operation::Sub,
-                rnix::ast::BinOpKind::Mul => Operation::Mul,
-                rnix::ast::BinOpKind::Div => Operation::Div,
-                rnix::ast::BinOpKind::And => Operation::And,
-                rnix::ast::BinOpKind::Equal => Operation::Equal,
-                rnix::ast::BinOpKind::Implication => Operation::Implication,
-                rnix::ast::BinOpKind::Less => Operation::Less,
-                rnix::ast::BinOpKind::LessOrEq => Operation::LessOrEqual,
-                rnix::ast::BinOpKind::More => Operation::More,
-                rnix::ast::BinOpKind::MoreOrEq => Operation::MoreOrEqual,
-                rnix::ast::BinOpKind::NotEqual => Operation::NotEqual,
-                rnix::ast::BinOpKind::Or => Operation::Or,
-            })
+        program.operations.push(Operation::SourceSpanPop);
+    }
+
+    pub fn compile(
+        working_directory: PathBuf,
+        filename: String,
+        file_content: String,
+        expression: Expr,
+    ) -> Program {
+        IRCompiler {
+            working_directory,
+            source_file: Rc::new(SourceFile {
+                filename,
+                content: file_content,
+            }),
         }
-        Expr::Paren(x) => build_program(here, x.expr().unwrap(), program),
-        Expr::AttrSet(x) => {
-            program.operations.push(Operation::CreateAttrset {
-                rec: x.rec_token().is_some(),
-            });
-            for inherit in x.inherits() {
-                let source = inherit
-                    .from()
-                    .and_then(|f| f.expr())
-                    .map(|source| create_program(here, source));
-                program.operations.push(Operation::InheritAttrs(
-                    source,
-                    inherit.attrs().map(attr_assert_const).collect(),
-                ));
-            }
-            for keyvalue in x.attrpath_values() {
-                let path = keyvalue.attrpath().unwrap();
-                let value = create_program(here, keyvalue.value().unwrap());
-                let n = build_attrpath(here, path, program);
-                program.operations.push(Operation::SetAttrpath(n, value));
-            }
-        }
-        Expr::UnaryOp(x) => {
-            build_program(here, x.expr().unwrap(), program);
-            program.operations.push(match x.operator().unwrap() {
-                rnix::ast::UnaryOpKind::Invert => Operation::Invert,
-                rnix::ast::UnaryOpKind::Negate => Operation::Negate,
-            })
-        }
-        Expr::Ident(x) => program.operations.push(Operation::Load(
-            x.ident_token().unwrap().green().text().to_string(),
-        )),
-        Expr::With(_) => todo!(),
-        Expr::HasAttr(x) => {
-            build_program(here, x.expr().unwrap(), program);
-            let attrpath = x.attrpath().unwrap();
-            let n = build_attrpath(here, attrpath, program);
-            program.operations.push(Operation::HasAttrpath(n))
-        }
-        _ => todo!(),
+        .create_program(expression)
     }
 }
 
@@ -429,19 +474,43 @@ use sysvunwind::*;
 const NIX_EXCEPTION_CLASS_SLICE: &[u8; 8] = b"FSH\0NIX\0";
 const NIX_EXCEPTION_CLASS: u64 = u64::from_le_bytes(*NIX_EXCEPTION_CLASS_SLICE);
 
-unsafe extern "C" fn nix_exception_cleanup(
-    code: _Unwind_Reason_Code,
-    _object: *const _Unwind_Exception,
-) {
-    println!("Nix exception deleted: {code:?}")
+#[repr(C)]
+struct NixException {
+    base: _Unwind_Exception,
+    pub message: String,
+    pub stacktrace: Vec<SourceSpan>,
+}
+
+impl NixException {
+    pub fn new(message: String) -> Box<Self> {
+        println!("0x{:?}", Self::cleanup as u64);
+        Box::new(Self {
+            base: _Unwind_Exception::new(NIX_EXCEPTION_CLASS, Self::cleanup),
+            message,
+            stacktrace: vec![],
+        })
+    }
+
+    pub fn raise(self: Box<Self>) -> ! {
+        let result =
+            unsafe { _Unwind_RaiseException(&mut Box::leak(self).base as *mut _Unwind_Exception) };
+        println!("NixException::raise: _Unwind_RaiseException failed: {result:?}");
+        std::process::abort();
+    }
+
+    unsafe extern "C" fn cleanup(code: _Unwind_Reason_Code, object: *mut _Unwind_Exception) {
+        let this = object as *mut NixException;
+        drop(Box::from_raw(object as *mut NixException));
+    }
 }
 
 #[no_mangle]
 unsafe extern "C" fn eh_personality(
     version: std::ffi::c_int,
     actions: std::ffi::c_int,
-    _exception: *const _Unwind_Exception,
-    _context: *const _Unwind_Context,
+    exception_class: u64,
+    exception: *const _Unwind_Exception,
+    context: *const _Unwind_Context,
 ) -> _Unwind_Reason_Code {
     assert_eq!(version, 1);
     println!(
@@ -449,11 +518,43 @@ unsafe extern "C" fn eh_personality(
         actions & _UA_SEARCH_PHASE > 0,
         actions & _UA_CLEANUP_PHASE > 0
     );
+    if actions & _UA_SEARCH_PHASE > 0 {
+        let cfa = _Unwind_GetCFA(context);
+        let region_start = _Unwind_GetRegionStart(context);
+        let ip = _Unwind_GetIP(context);
+        println!("cfa = 0x{:x}", cfa);
+        println!("region start = 0x{:x}", region_start);
+        println!("ip = {} 0x{:x}", ip, ip);
+        let span = COMPILER.source_span_for(ip);
+        println!("source span = {:?}", span);
+
+        if let Some(ref span) = span {
+            let source = &span.file.content;
+            let span_line_start = source[..span.range.start().into()]
+                .rfind('\n')
+                .map(|x| x + 1)
+                .unwrap_or(0);
+            let span_line_end = source[span.range.end().into()..]
+                .find('\n')
+                .map(|x| x + Into::<usize>::into(span.range.end()))
+                .unwrap_or(source.len());
+            println!("{}", &source[span_line_start..span_line_end]);
+        }
+
+        if exception_class == NIX_EXCEPTION_CLASS {
+            let exception = &mut *(exception as *mut NixException);
+            if let Some(span) = span {
+                exception.stacktrace.push(span);
+            }
+        }
+    }
+
     if actions & _UA_CLEANUP_PHASE > 0 {
         // TODO: Cleanup stack
         //       This requires saving more information in unwind data.
         //       (we need to know when the stack pointer was when the unwind happened)
     }
+
     _URC_CONTINUE_UNWIND
 }
 
@@ -516,7 +617,7 @@ fn create_eh_frame(
             // fde augmentation section
             uleb128(&mut data, 0);
             // call frame instructions
-            let fde_program_start = data.len();
+            // let fde_program_start = data.len();
             fde_instruction_builder(i, &fde, &mut data);
             // eprintln!("program for fde {i} is {:?}", &data[fde_program_start..]);
             dwarf_align(&mut data, fde_start);
@@ -628,7 +729,6 @@ impl LazyValueImpl {
                 });
                 // eprintln!("evaluating lazy JIT executable");
                 let result = (**executable).run(*scope, &Value::NULL).into_evaluated();
-                unsafe { Rc::decrement_strong_count(executable) };
                 *self = LazyValueImpl::Evaluated(result);
                 // eprintln!("evaluated lazy JIT executable");
                 LAZY_DEPTH.with(|x| unsafe {
@@ -1269,11 +1369,8 @@ fn create_root_scope() -> *mut Scope {
 
     let throw_function = UnpackedValue::new_function(|message| {
         let message = extract_typed!("throw", String(move message));
-        let exception = _Unwind_Exception::new(NIX_EXCEPTION_CLASS, nix_exception_cleanup);
-        println!("builtins.throw {message}");
-        let result = unsafe { _Unwind_RaiseException(&exception as *const _Unwind_Exception) };
-        eprintln!("_Unwind_RaiseException failed: {result:?}");
-        std::process::abort();
+        println!("builtins.throw called");
+        NixException::new(Rc::unwrap_or_clone(message)).raise()
     })
     .pack();
 
@@ -2049,7 +2146,7 @@ fn create_root_scope() -> *mut Scope {
         "import".to_string(),
         UnpackedValue::new_function(|value| {
             let path = extract_typed!("import", Path(move value));
-            import(&path)
+            import(Rc::unwrap_or_clone(path))
         })
         .pack(),
     );
@@ -2070,20 +2167,26 @@ thread_local! {
     static ROOT_SCOPE: *mut Scope = create_root_scope();
 }
 
-fn import(path: &Path) -> Value {
-    let (here, expr) = match std::fs::read_to_string(path) {
+static mut COMPILER: Compiler = Compiler::new();
+
+fn import(path: PathBuf) -> Value {
+    let (path, expr) = match std::fs::read_to_string(&path) {
         Err(e) if e.to_string().contains("Is a directory") => {
-            std::fs::read_to_string(path.join("default.nix")).map(|s| (path, s))
+            let default = path.join("default.nix");
+            std::fs::read_to_string(&default).map(|s| (default, s))
         }
-        other => other.map(|s| (path.parent().unwrap(), s)),
+        other => other.map(|s| (path, s)),
     }
     .unwrap();
 
     let result = rnix::Root::parse(&expr);
-    let root = result.tree();
-    let mut root_block = Program { operations: vec![] };
-    build_program(here, root.expr().unwrap(), &mut root_block);
-    let compiled = compiler::compile(root_block, None).unwrap();
+    let program = IRCompiler::compile(
+        path.parent().unwrap().to_path_buf(),
+        path.to_string_lossy().to_string(),
+        expr,
+        result.tree().expr().unwrap(),
+    );
+    let compiled = unsafe { COMPILER.compile(program, None).unwrap() };
     ROOT_SCOPE.with(|root| compiled.run(*root, &Value::NULL))
 }
 
@@ -2143,56 +2246,84 @@ fn scope_from_map_get_works() {
     }
 }
 
-fn dwarf_testing() {
-    let function = compiler::compile(
-        Program {
-            operations: vec![
-                Operation::Push(Value::NULL),
-                Operation::Push(
-                    UnpackedValue::new_function(|_| {
-                        let exception =
-                            _Unwind_Exception::new(NIX_EXCEPTION_CLASS, nix_exception_cleanup);
-                        let result = unsafe {
-                            _Unwind_RaiseException(&exception as *const _Unwind_Exception)
-                        };
-                        eprintln!("_Unwind_RaiseException: {result:?}");
-                        std::process::abort()
-                    })
-                    .pack(),
-                ),
-                Operation::Apply,
-            ],
-        },
-        None,
-    )
-    .unwrap();
-    let executable = compiler::compile(
-        Program {
-            operations: vec![
-                Operation::Push(Value::NULL),
-                Operation::Push(UnpackedValue::Function(Rc::new(Function {
-                    call: function.code(),
-                    _executable: None,
-                    builtin_closure: None,
-                    parent_scope: std::ptr::null_mut(),
-                })).pack()),
-                Operation::Apply,
-            ],
-        },
-        None,
-    )
-    .unwrap();
-    // std::panic::catch_unwind(|| {
-    let result = executable.run(std::ptr::null_mut(), &Value::NULL);
-    println!("{result:?}");
-    std::process::abort();
-    // })
-    // .unwrap_or(())
-}
+// fn dwarf_testing() {
+//     let function = unsafe {
+//         COMPILER
+//             .compile(
+//                 Program {
+//                     operations: vec![
+//                         Operation::SourceSpanPush(SourceSpan {
+//                             file: Rc::new("xd2.nix".to_string()),
+//                             range: TextRange::new(0.into(), 20.into()),
+//                         }),
+//                         Operation::Push(Value::NULL),
+//                         Operation::Push(
+//                             UnpackedValue::new_function(|_| {
+//                                 let mut a = vec![2, 4, 1, 6, 7];
+//                                 a.sort();
+//                                 println!("{a:?}");
+//                                 let exception = _Unwind_Exception::new(
+//                                     NIX_EXCEPTION_CLASS,
+//                                     nix_exception_cleanup,
+//                                 );
+//                                 let result = unsafe {
+//                                     _Unwind_RaiseException(&exception as *const _Unwind_Exception)
+//                                 };
+//                                 eprintln!("_Unwind_RaiseException: {result:?}");
+//                                 std::process::abort()
+//                             })
+//                             .pack(),
+//                         ),
+//                         Operation::Apply,
+//                         Operation::SourceSpanPop,
+//                     ],
+//                 },
+//                 None,
+//             )
+//             .unwrap()
+//     };
+//     let executable = unsafe {
+//         COMPILER
+//             .compile(
+//                 Program {
+//                     operations: vec![
+//                         Operation::SourceSpanPush(SourceSpan {
+//                             file: Rc::new("xd.nix".to_string()),
+//                             range: TextRange::new(10.into(), 20.into()),
+//                         }),
+//                         Operation::Push(Value::NULL),
+//                         Operation::Push(
+//                             UnpackedValue::Function(Rc::new(Function {
+//                                 call: function.code(),
+//                                 _executable: None,
+//                                 builtin_closure: None,
+//                                 parent_scope: std::ptr::null_mut(),
+//                             }))
+//                             .pack(),
+//                         ),
+//                         Operation::Apply,
+//                         Operation::SourceSpanPop,
+//                     ],
+//                 },
+//                 None,
+//             )
+//             .unwrap()
+//     };
+//     // std::panic::catch_unwind(|| {
+//     let result = executable.run(std::ptr::null_mut(), &Value::NULL);
+//     println!("{result:?}");
+//     std::process::abort();
+//     // })
+//     // .unwrap_or(())
+// }
+// dwarf_testing();
 
 fn main() {
-    dwarf_testing();
-    let value = import(&PathBuf::from(std::env::args().nth(1).unwrap()));
-    seq(&value, true);
-    println!("{}", value);
+    let value = import(PathBuf::from(std::env::args().nth(1).unwrap()));
+    println!("--- SEQ ---");
+    std::panic::catch_unwind(move || {
+        seq(&value, true);
+        println!("{}", value);
+    })
+    .unwrap();
 }

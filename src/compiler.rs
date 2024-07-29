@@ -1,7 +1,15 @@
-use std::{arch::asm, ffi::c_void, mem::offset_of, rc::Rc};
+use std::{
+    arch::asm,
+    collections::BTreeMap,
+    ffi::c_void,
+    mem::offset_of,
+    rc::{Rc, Weak},
+};
 
 use crate::{
-    create_eh_frame, dwarf::*, sysvunwind::__register_frame, Fde, Function, Operation, Parameter, Program, Scope, Value, ValueKind, __deregister_frame, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH
+    create_eh_frame, dwarf::*, sysvunwind::__register_frame, Fde, Function, Operation, Parameter,
+    Program, Scope, SourceSpan, Value, ValueKind, __deregister_frame, ATTRSET_TAG_LAZY,
+    ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -62,12 +70,11 @@ impl ExecutableInternable for Value {
     }
 }
 
-impl ExecutableInternable for Executable {
+impl ExecutableInternable for Rc<Executable> {
     type Output = *const Executable;
     fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
-        let rc = Rc::new(self);
-        let ptr = Rc::as_ptr(&rc);
-        closure._executables.push(rc);
+        let ptr = Rc::as_ptr(&self);
+        closure._executables.push(self);
         ptr
     }
 }
@@ -86,25 +93,51 @@ pub struct Executable {
     eh_frame: Box<[u8]>,
     len: usize,
     code: extern "C-unwind" fn(Value, Value) -> Value,
+    // start address -> (end address, source span) map
+    source_map: BTreeMap<u64, (u64, SourceSpan)>,
 }
 
 impl Executable {
     #[inline(always)]
     pub fn run(&self, scope: *mut Scope, arg: &Value) -> Value {
-        unsafe {
-            asm!("mov r15, {}", in(reg) scope, out("r15") _);
+        println!("executable at {:?} running", self.code as *const ());
+        let r = unsafe {
+            asm!("mov r10, {}", in(reg) scope, out("r10") _);
             (self.code)(Value::NULL, arg.leaking_copy())
-        }
+        };
+        println!("executable at {:?} ran", self.code as *const ());
+        r
     }
 
     #[inline(always)]
     pub fn code(&self) -> unsafe extern "C-unwind" fn(Value, Value) -> Value {
         self.code
     }
+
+    #[inline(always)]
+    pub fn code_address_range(&self) -> (u64, u64) {
+        (self.code as u64, self.code as u64 + self.len as u64)
+    }
+
+    pub fn source_span_for(&self, address: u64) -> Option<&SourceSpan> {
+        self.source_map
+            .range(..=address)
+            .rev()
+            .find_map(
+                |(_, (end, span))| {
+                    if *end <= address {
+                        None
+                    } else {
+                        Some(span)
+                    }
+                },
+            )
+    }
 }
 
 impl Drop for Executable {
     fn drop(&mut self) {
+        println!("executable at {:?} dropped", self.code as *mut ());
         unsafe {
             if nix::libc::munmap(self.code as *mut c_void, self.len) < 0 {
                 panic!("munmap failed");
@@ -114,38 +147,63 @@ impl Drop for Executable {
     }
 }
 
-pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable, IcedError> {
-    let debug_header = format!("{program:?}");
+pub struct Compiler {
+    source_maps: BTreeMap<u64, Weak<Executable>>,
+}
 
-    let mut closure = ExecutableClosure::new(param.map(|param| {
-        Box::new(match param {
-            Parameter::Ident(name) => CompiledParameter::Ident(name),
-            Parameter::Pattern {
-                entries,
-                binding,
-                ignore_unmatched,
-            } => CompiledParameter::Pattern {
-                entries: entries
-                    .into_iter()
-                    .map(|(name, default)| {
-                        Ok::<(String, Option<Rc<Executable>>), IcedError>((
-                            name,
-                            default
-                                .map(|program| compile(program, None).map(Rc::new))
-                                .transpose()?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap(),
-                binding,
-                ignore_unmatched,
-            },
-        })
-    }));
+impl Compiler {
+    pub const fn new() -> Self {
+        Self {
+            source_maps: BTreeMap::new(),
+        }
+    }
 
-    let function_enter_ins: usize;
-    let function_leave_ins: usize;
-    let result = {
+    pub fn source_span_for(&self, address: u64) -> Option<SourceSpan> {
+        self.source_maps
+            .range(..=address)
+            .rev()
+            .find_map(|(_, executable)| executable.upgrade())
+            .and_then(|executable| executable.source_span_for(address).cloned())
+    }
+
+    pub fn compile(
+        &mut self,
+        program: Program,
+        param: Option<Parameter>,
+    ) -> Result<Rc<Executable>, IcedError> {
+        let debug_header = format!("{program:?}");
+
+        let mut closure = ExecutableClosure::new(param.map(|param| {
+            Box::new(match param {
+                Parameter::Ident(name) => CompiledParameter::Ident(name),
+                Parameter::Pattern {
+                    entries,
+                    binding,
+                    ignore_unmatched,
+                } => CompiledParameter::Pattern {
+                    entries: entries
+                        .into_iter()
+                        .map(|(name, default)| {
+                            Ok::<(String, Option<Rc<Executable>>), IcedError>((
+                                name,
+                                default
+                                    .map(|program| self.compile(program, None))
+                                    .transpose()?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                    binding,
+                    ignore_unmatched,
+                },
+            })
+        }));
+        let mut source_span_stack = vec![];
+        let mut source_spans = vec![];
+
+        let function_enter_ins: usize;
+        let function_leave_ins: usize;
+        let result = {
             let mut asm = CodeAssembler::new(64)?;
             asm.push(rbp)?;
             asm.mov(rbp, rsp)?;
@@ -155,13 +213,9 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
             asm.push(r12)?;
             asm.push(r13)?;
             asm.push(r14)?;
-            // invariant: r15 contains our scope (set by the caller)
-            // asm.push(r15)?;
-            function_enter_ins = asm.instructions().len();
+            asm.push(r15)?;
 
-            // These values are always kept here
-            asm.mov(r13, ATTRSET_TAG_LAZY)?;
-            asm.mov(r14, ATTRSET_TAG_MASK)?;
+            function_enter_ins = asm.instructions().len();
 
             // keep track of whether we need to align the stack when calling
             // and also verify the operations are valid and won't consume
@@ -170,13 +224,13 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
 
             macro_rules! call {
                 (reg $reg: ident) => {
-                    if stack_values % 2 != (closure.parameter.is_some() as usize) {
+                    if stack_values % 2 == 0 {
                         asm.sub(rsp, 8)?;
                     }
 
                     asm.call($reg)?;
 
-                    if stack_values % 2 != (closure.parameter.is_some() as usize) {
+                    if stack_values % 2 == 0 {
                         asm.add(rsp, 8)?;
                     }
                 };
@@ -208,7 +262,6 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                 )?;
                 asm.mov(rdx, param as u64)?;
 
-                asm.push(r15)?;
                 call!(rust create_function_scope);
                 asm.mov(r15, rax)?;
                 asm.jmp(end)?;
@@ -216,11 +269,17 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                 asm.set_label(&mut not_a_function)?;
                 asm.mov(rsi, rdi)?;
                 asm.mov(rdi, c"INTERNAL ERROR: Function receiver is not a Function".as_ptr() as u64)?;
-                asm.pop(r15)?;
                 call!(rust asm_panic_with_value);
 
                 asm.set_label(&mut end)?;
+            } else {
+                // r10 contains our scope (set by the caller)
+                asm.mov(r15, r10)?;
             }
+
+            // These values are always kept here
+            asm.mov(r13, ATTRSET_TAG_LAZY)?;
+            asm.mov(r14, ATTRSET_TAG_MASK)?;
 
             for operation in program.operations {
                 macro_rules! unlazy {
@@ -327,24 +386,6 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                 }};
             }
 
-                // TODO: something like this but maybe use r14 as a temporary register?
-                //       (so that one does not forget and just overwrite it)
-                // macro_rules! check {
-                //     (Attrset $reg: ident else => $else: ident) => {
-                //             asm.mov(rbx, rdi)?;
-                //             asm.and(rbx, VALUE_TAG_MASK as i32)?;
-                //             asm.cmp(bl, ValueKind::Attrset as u32)?;
-                //             asm.jne($else)?;
-                //             asm.cmp(rdi, 0)?; // attrset tag also applies to null
-                //             asm.je($else)?;
-                //     };
-                //     ($tag: ident $reg: ident else => $else: ident) => {
-                //             asm.mov(rbx, rdi)?;
-                //             asm.and(rbx, VALUE_TAG_MASK as i32)?;
-                //             asm.cmp(bl, ValueKind::$tag as u32)?;
-                //             asm.jne($else)?;
-                //     }
-                // }
                 macro_rules! unpack {
                     (Attrset $reg: ident tmp = $tmp: ident else => $else: ident) => {{
                         asm.mov($tmp, $reg)?;
@@ -363,7 +404,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         stack_values += 1;
                     }
                     Operation::PushFunction(param, program) => {
-                        let raw = closure.intern(compile(program, Some(param))?);
+                        let raw = closure.intern(self.compile(program, Some(param))?);
                         asm.mov(rdi, raw as u64)?;
                         asm.mov(rsi, r15)?;
                         call!(rust create_function_value);
@@ -439,7 +480,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         }
                     }
                     Operation::SetAttrpath(components, value_program) => {
-                        let raw = closure.intern(compile(value_program, None)?);
+                        let raw = closure.intern(self.compile(value_program, None)?);
 
                         assert!(stack_values > components);
                         asm.mov(rdi, qword_ptr(rsp + (8 * components)))?;
@@ -508,7 +549,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         if let Some(program) = source {
                             asm.mov(rsi, rdi)?;
                             asm.mov(rdi, r15)?;
-                            asm.mov(rdx, closure.intern(compile(program, None)?) as u64)?;
+                            asm.mov(rdx, closure.intern(self.compile(program, None)?) as u64)?;
                             asm.mov(rcx, names.as_ptr() as u64)?;
                             asm.mov(r8, names.len() as u64)?;
                             call!(rust map_inherit_from);
@@ -534,7 +575,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                     }
                     Operation::GetAttrConsume { default } => {
                         let default = if let Some(program) = default {
-                            closure.intern(compile(program, None)?)
+                            closure.intern(self.compile(program, None)?)
                         } else { std::ptr::null() };
 
                         assert!(stack_values >= 2);
@@ -565,8 +606,9 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
 
                         asm.set_label(&mut not_an_attrset)?;
 
+                        asm.mov(rsi, rdi)?;
                         asm.mov(rdi, c"getattr called on non-attrset value".as_ptr() as u64)?;
-                        call!(rust asm_panic);
+                        call!(rust asm_panic_with_value);
 
                         asm.set_label(&mut end)?;
                         stack_values += 1;
@@ -672,7 +714,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         stack_values += 1;
                     }
                     Operation::ListAppend(value_program) => {
-                        let raw = closure.intern(compile(value_program, None)?);
+                        let raw = closure.intern(self.compile(value_program, None)?);
 
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
@@ -705,7 +747,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                     }
                     Operation::ScopeSet(name, value_program) => {
                         let name = closure.intern(name);
-                        let raw = closure.intern(compile(value_program, None)?);
+                        let raw = closure.intern(self.compile(value_program, None)?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, name.as_ptr() as u64)?;
                         asm.mov(rdx, name.len() as u64)?;
@@ -717,7 +759,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         if let Some(program) = from {
                             asm.mov(rdi, r15)?;
                             asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, values)))?;
-                            asm.mov(rdx, closure.intern(compile(program, None)?) as u64)?;
+                            asm.mov(rdx, closure.intern(self.compile(program, None)?) as u64)?;
                             asm.mov(rcx, names.as_ptr() as u64)?;
                             asm.mov(r8, names.len() as u64)?;
                             call!(rust map_inherit_from);
@@ -734,8 +776,9 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         asm.mov(r15, qword_ptr(r15 + offset_of!(Scope, previous)))?;
                     }
                     Operation::IfElse(if_true, if_false) => {
-                        let if_true = closure.intern(compile(if_true, None)?);
-                        let if_false = closure.intern(compile(if_false, None)?);
+                        // TODO: inline these into this executable instead
+                        let if_true = closure.intern(self.compile(if_true, None)?);
+                        let if_false = closure.intern(self.compile(if_false, None)?);
 
                         assert!(stack_values >= 1);
                         asm.pop(rsi)?;
@@ -757,6 +800,7 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         asm.cmp(rsi, ValueKind::Bool as i32)?;
                         asm.cmovne(rax, rbx)?;
 
+                        asm.mov(r10, r15)?;
                         call!(reg rax);
                         asm.push(rax)?;
                         asm.jmp(end)?;
@@ -926,16 +970,28 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
                         call!(rust value_string_to_path);
                         asm.mov(qword_ptr(rsp), rax)?;
                     }
+                    Operation::SourceSpanPush(span) => {
+                        source_span_stack.push((
+                            asm.instructions().len(),
+                            span
+                        ))
+                    }
+                    Operation::SourceSpanPop => {
+                        let (start, span) = source_span_stack.pop().unwrap();
+                        source_spans.push((
+                            start,
+                            asm.instructions().len(),
+                            span
+                        ));
+                    }
                 }
             }
 
             assert_eq!(stack_values, 1);
             asm.pop(rax)?;
 
-            if closure.parameter.is_some() {
-                asm.pop(r15)?;
-            }
             // callee saved registers
+            asm.pop(r15)?;
             asm.pop(r14)?;
             asm.pop(r13)?;
             asm.pop(r12)?;
@@ -951,94 +1007,122 @@ pub fn compile(program: Program, param: Option<Parameter>) -> Result<Executable,
             )?
         }.inner;
 
-    // eprintln!("{}", debug_header);
-    // let decoder = iced_x86::Decoder::new(64, &result.code_buffer, 0);
-    // let mut formatter = iced_x86::IntelFormatter::new();
-    // let mut output = String::new();
-    // for instruction in decoder {
-    //     output.clear();
-    //     iced_x86::Formatter::format(&mut formatter, &instruction, &mut output);
-    //     eprintln!("\t{output}")
-    // }
+        // eprintln!("{}", debug_header);
+        // let decoder = iced_x86::Decoder::new(64, &result.code_buffer, 0);
+        // let mut formatter = iced_x86::IntelFormatter::new();
+        // let mut output = String::new();
+        // for instruction in decoder {
+        //     output.clear();
+        //     iced_x86::Formatter::format(&mut formatter, &instruction, &mut output);
+        //     eprintln!("\t{output}")
+        // }
 
-    unsafe {
-        let code = &result.code_buffer;
-        let code_mem = nix::libc::mmap(
-            std::ptr::null_mut(),
-            code.len(),
-            PROT_READ | PROT_WRITE,
-            MAP_ANONYMOUS | MAP_PRIVATE,
-            -1,
-            0,
-        );
-        if code_mem == MAP_FAILED {
-            panic!("mmap failed");
+        unsafe {
+            let code = &result.code_buffer;
+            let code_mem = nix::libc::mmap(
+                std::ptr::null_mut(),
+                code.len(),
+                PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS | MAP_PRIVATE,
+                -1,
+                0,
+            );
+            if code_mem == MAP_FAILED {
+                panic!("mmap failed");
+            }
+            (code_mem as *mut u8).copy_from(code.as_ptr(), code.len());
+            if nix::libc::mprotect(code_mem, code.len(), PROT_EXEC | PROT_READ) < 0 {
+                panic!("mprotect failed");
+            }
+
+            // FIXME: still broken
+            #[allow(unused_assignments)]
+            let frame = create_eh_frame(
+                [Fde {
+                    initial_location: code_mem as u64,
+                    address_range: code.len() as u64,
+                }],
+                1,
+                -8,
+                // TODO: The CIE could be shared
+                |cie| {
+                    DW_CFA_advance_loc(
+                        cie,
+                        result.new_instruction_offsets[function_enter_ins] as u8,
+                    );
+                    DW_CFA_def_cfa(cie, 7, 8);
+                    DW_CFA_offset(cie, 16, 1);
+                },
+                |_index, _fde, out: &mut Vec<u8>| {
+                    let mut ip = 0u64;
+                    macro_rules! advance_to {
+                        ($fun: ident[$width: ident], $x: expr) => {{
+                            let _x: u64 = $x;
+                            let advance = _x - ip;
+                            $fun(out, advance as $width);
+                            ip += advance;
+                        }};
+                    }
+
+                    advance_to!(
+                        DW_CFA_advance_loc[u8],
+                        result.new_instruction_offsets[function_enter_ins].into()
+                    );
+                    DW_CFA_def_cfa_offset(out, 16);
+                    DW_CFA_offset(out, /* rbp */ 6, 2);
+
+                    DW_CFA_offset(out, 3, 3);
+                    DW_CFA_offset(out, 12, 4);
+                    DW_CFA_offset(out, 13, 5);
+                    DW_CFA_offset(out, 14, 6);
+
+                    DW_CFA_def_cfa_register(out, /* rbp */ 6);
+                    advance_to!(
+                        DW_CFA_advance_loc4[u32],
+                        result.new_instruction_offsets[function_leave_ins].into()
+                    );
+                    DW_CFA_def_cfa(out, /* rsp */ 7, 8);
+                    DW_CFA_same_value(out, 3);
+                    DW_CFA_same_value(out, 12);
+                    DW_CFA_same_value(out, 13);
+                    DW_CFA_same_value(out, 14);
+                },
+            )
+            .into_boxed_slice();
+            // println!("{:?}", frame.as_ptr());
+            // walk_eh_frame_fdes(&frame[..], |offset| {
+            //     println!("registering fde at offset {offset}");
+            //     __register_frame(frame.as_ptr().add(offset));
+            // });
+            __register_frame(frame.as_ptr());
+
+            let source_map = source_spans
+                .into_iter()
+                .map(|(start_ins, end_ins, span)| {
+                    (
+                        code_mem as u64 + result.new_instruction_offsets[start_ins] as u64,
+                        (
+                            code_mem as u64 + result.new_instruction_offsets[end_ins] as u64,
+                            span,
+                        ),
+                    )
+                })
+                .collect();
+
+            eprintln!("new executable at 0x{:x}", code_mem as u64);
+            for (start, (end, span)) in (&source_map as &BTreeMap<u64, (u64, SourceSpan)>).iter() {
+                eprintln!("0x{start:x}-0x{end:x} -> {span:?}")
+            }
+
+            let rc = Rc::new(Executable {
+                _closure: closure,
+                eh_frame: frame,
+                code: std::mem::transmute(code_mem),
+                len: code.len(),
+                source_map,
+            });
+            self.source_maps.insert(code_mem as u64, Rc::downgrade(&rc));
+            Ok(rc)
         }
-        (code_mem as *mut u8).copy_from(code.as_ptr(), code.len());
-        if nix::libc::mprotect(code_mem, code.len(), PROT_EXEC | PROT_READ) < 0 {
-            panic!("mprotect failed");
-        }
-
-        // FIXME: still broken
-        #[allow(unused_assignments)]
-        let frame = create_eh_frame(
-            [Fde {
-                initial_location: code_mem as u64,
-                address_range: code.len() as u64,
-            }],
-            1,
-            -8,
-            // TODO: The CIE could be shared
-            |cie| {
-                DW_CFA_advance_loc(
-                    cie,
-                    result.new_instruction_offsets[function_enter_ins] as u8,
-                );
-                DW_CFA_def_cfa(cie, 7, 8);
-                DW_CFA_offset(cie, 16, 1);
-                // DW_CFA_offset(cie, 14, 0);
-                // DW_CFA_offset(cie, 13, (-1i64) as u64);
-                // DW_CFA_offset(cie, 12, (-2i64) as u64);
-                // DW_CFA_offset(cie, 3, (-3i64) as u64);
-            },
-            |_index, _fde, out: &mut Vec<u8>| {
-                let mut ip = 0u64;
-                macro_rules! advance_to {
-                    ($fun: ident[$width: ident], $x: expr) => {{
-                        let _x: u64 = $x;
-                        let advance = _x - ip;
-                        $fun(out, advance as $width);
-                        ip += advance;
-                    }};
-                }
-
-                advance_to!(
-                    DW_CFA_advance_loc[u8],
-                    result.new_instruction_offsets[function_enter_ins].into()
-                );
-                DW_CFA_def_cfa_offset(out, 16);
-                DW_CFA_offset(out, /* rbp */ 6, 2);
-                DW_CFA_def_cfa_register(out, /* rbp */ 6);
-                advance_to!(
-                    DW_CFA_advance_loc4[u32],
-                    result.new_instruction_offsets[function_leave_ins].into()
-                );
-                DW_CFA_def_cfa(out, /* rsp */ 7, 8);
-            },
-        )
-        .into_boxed_slice();
-        // println!("{:?}", frame.as_ptr());
-        // walk_eh_frame_fdes(&frame[..], |offset| {
-        //     println!("registering fde at offset {offset}");
-        //     __register_frame(frame.as_ptr().add(offset));
-        // });
-        __register_frame(frame.as_ptr());
-
-        Ok(Executable {
-            _closure: closure,
-            eh_frame: frame,
-            code: std::mem::transmute(code_mem),
-            len: code.len(),
-        })
     }
 }

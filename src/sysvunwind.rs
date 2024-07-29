@@ -4,7 +4,7 @@
 use std::ffi::{c_int, c_void};
 
 pub type _Unwind_Exception_Cleanup_Fn =
-    unsafe extern "C" fn(_Unwind_Reason_Code, *const _Unwind_Exception);
+    unsafe extern "C" fn(_Unwind_Reason_Code, *mut _Unwind_Exception);
 
 pub type _Unwind_Personality_Fn = unsafe extern "C" fn(
     c_int,
@@ -17,7 +17,7 @@ pub type _Unwind_Personality_Fn = unsafe extern "C" fn(
 pub type _Unwind_Exception_Class = u64;
 pub type _Unwind_Action = c_int;
 
-pub type _Unwind_Stop_Fn = extern "C" fn(
+pub type _Unwind_Stop_Fn = unsafe extern "C" fn(
     c_int,
     _Unwind_Action,
     _Unwind_Exception_Class,
@@ -53,7 +53,7 @@ pub struct _Unwind_Context {
 extern "C" {
     pub fn __register_frame(pointer: *const u8);
     pub fn __deregister_frame(pointer: *const u8);
-    pub fn _Unwind_RaiseException(exception: *const _Unwind_Exception) -> _Unwind_Reason_Code;
+    pub fn _Unwind_RaiseException(exception: *mut _Unwind_Exception) -> _Unwind_Reason_Code;
     pub fn _Unwind_Resume(exception: *const _Unwind_Exception);
     pub fn _Unwind_DeleteException(exception: *mut _Unwind_Exception);
     pub fn _Unwind_GetGR(context: *const _Unwind_Context, index: c_int) -> u64;
@@ -65,11 +65,12 @@ extern "C" {
     pub fn _Unwind_ForcedUnwind(
         exception: *const _Unwind_Exception,
         stop_fn: _Unwind_Stop_Fn,
-        data: *const c_void,
+        arg: *mut c_void,
     ) -> _Unwind_Reason_Code;
     pub fn _Unwind_GetCFA(context: *const _Unwind_Context) -> u64;
     // libgcc also contains these but they don't seem to be defined by the ABI
     // alias (_Unwind_Backtrace);
+    // pub fn _Unwind_Backtrace(trace: _Unwind_Trace_Fn, arg: *mut std::ffi::c_void) -> _Unwind_Reason_Code ;
     // alias (_Unwind_FindEnclosingFunction);
     // alias (_Unwind_GetDataRelBase);
     // alias (_Unwind_GetTextRelBase);
