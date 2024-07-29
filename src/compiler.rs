@@ -170,7 +170,7 @@ impl Compiler {
         program: Program,
         param: Option<Parameter>,
     ) -> Result<Rc<Executable>, IcedError> {
-        let debug_header = format!("{program:?}");
+        // let debug_header = format!("{program:?}");
 
         let mut closure = ExecutableClosure::new(param.map(|param| {
             Box::new(match param {

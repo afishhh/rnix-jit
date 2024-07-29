@@ -862,11 +862,11 @@ impl UnpackedValue {
             Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
-                    write!(f, "Lazy(")?;
-                    x.unpack().fmt_display_rec(depth, f)?;
-                    write!(f, ")")
+                    write!(f, "«lazy ")?;
+                    x.unpack().fmt_debug_rec(depth, f)?;
+                    write!(f, "»")
                 } else {
-                    write!(f, "...")
+                    write!(f, "«lazy»")
                 }
             }
             Self::Null => write!(f, "null"),
@@ -2021,8 +2021,8 @@ fn seq(value: &Value, deep: bool) {
         UnpackedValue::Bool(_) => (),
         UnpackedValue::List(value) => {
             let list = unsafe { &mut *value.get() };
-            for value in list.iter() {
-                let value = value.evaluate();
+            for value in list.iter_mut() {
+                let value = value.evaluate_mut();
                 if deep {
                     seq(value, deep);
                 }
@@ -2031,7 +2031,7 @@ fn seq(value: &Value, deep: bool) {
         UnpackedValue::Attrset(value) => {
             let map = unsafe { &mut *value.get() };
             for (_, value) in map.iter_mut() {
-                let value = value.evaluate();
+                let value = value.evaluate_mut();
                 if deep {
                     seq(value, deep);
                 }
