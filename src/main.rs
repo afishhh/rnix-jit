@@ -1859,7 +1859,19 @@ fn create_root_scope() -> *mut Scope {
                     let regex = Regex::new(extract_typed!("split", String(move regex)).as_str()).unwrap();
                     UnpackedValue::new_function(move |string| {
                         let string = extract_typed!("split", String(move string));
-                        UnpackedValue::new_list(regex.split(&string).map(|part| UnpackedValue::new_string(part.to_string()).pack()).collect()).pack()
+                        let mut result = vec![];
+                        let mut last = 0;
+                        for captures in regex.captures_iter(&string) {
+                            let whole = captures.get(0).unwrap();
+                            result.push(UnpackedValue::new_string(string[last..whole.start()].to_string()).pack());
+                            result.push(UnpackedValue::new_list(
+                                captures.iter().skip(1).filter_map(|x| x).map(|x| UnpackedValue::new_string(string[x.start()..x.end()].to_string()).pack()).collect()).pack());
+                            last = whole.end();
+                        }
+                        if last != string.len() {
+                            result.push(UnpackedValue::new_string(string[last..].to_string()).pack())
+                        };
+                        UnpackedValue::new_list(result).pack()
                     }).pack()
                 }).pack()
             );
