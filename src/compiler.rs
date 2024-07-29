@@ -7,9 +7,8 @@ use std::{
 };
 
 use crate::{
-    create_eh_frame, dwarf::*, sysvunwind::__register_frame, Fde, Function, Operation, Parameter,
-    Program, Scope, SourceSpan, Value, ValueKind, __deregister_frame, ATTRSET_TAG_LAZY,
-    ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH,
+    dwarf::*, unwind::*, exception::*, Function, Operation, Parameter, Program, Scope, SourceSpan, Value,
+    ValueKind, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -100,12 +99,12 @@ pub struct Executable {
 impl Executable {
     #[inline(always)]
     pub fn run(&self, scope: *mut Scope, arg: &Value) -> Value {
-        println!("executable at {:?} running", self.code as *const ());
+        // println!("executable at {:?} running", self.code as *const ());
         let r = unsafe {
             asm!("mov r10, {}", in(reg) scope, out("r10") _);
             (self.code)(Value::NULL, arg.leaking_copy())
         };
-        println!("executable at {:?} ran", self.code as *const ());
+        // println!("executable at {:?} ran", self.code as *const ());
         r
     }
 
@@ -137,7 +136,7 @@ impl Executable {
 
 impl Drop for Executable {
     fn drop(&mut self) {
-        println!("executable at {:?} dropped", self.code as *mut ());
+        // println!("executable at {:?} dropped", self.code as *mut ());
         unsafe {
             if nix::libc::munmap(self.code as *mut c_void, self.len) < 0 {
                 panic!("munmap failed");
@@ -1037,14 +1036,11 @@ impl Compiler {
 
             // FIXME: still broken
             #[allow(unused_assignments)]
-            let frame = create_eh_frame(
-                [Fde {
-                    initial_location: code_mem as u64,
-                    address_range: code.len() as u64,
-                }],
+            let frame = EhFrameBuilder::new(
                 1,
                 -8,
                 // TODO: The CIE could be shared
+                jit_personality,
                 |cie| {
                     DW_CFA_advance_loc(
                         cie,
@@ -1053,41 +1049,42 @@ impl Compiler {
                     DW_CFA_def_cfa(cie, 7, 8);
                     DW_CFA_offset(cie, 16, 1);
                 },
-                |_index, _fde, out: &mut Vec<u8>| {
-                    let mut ip = 0u64;
-                    macro_rules! advance_to {
-                        ($fun: ident[$width: ident], $x: expr) => {{
-                            let _x: u64 = $x;
-                            let advance = _x - ip;
-                            $fun(out, advance as $width);
-                            ip += advance;
-                        }};
-                    }
-
-                    advance_to!(
-                        DW_CFA_advance_loc[u8],
-                        result.new_instruction_offsets[function_enter_ins].into()
-                    );
-                    DW_CFA_def_cfa_offset(out, 16);
-                    DW_CFA_offset(out, /* rbp */ 6, 2);
-
-                    DW_CFA_offset(out, 3, 3);
-                    DW_CFA_offset(out, 12, 4);
-                    DW_CFA_offset(out, 13, 5);
-                    DW_CFA_offset(out, 14, 6);
-
-                    DW_CFA_def_cfa_register(out, /* rbp */ 6);
-                    advance_to!(
-                        DW_CFA_advance_loc4[u32],
-                        result.new_instruction_offsets[function_leave_ins].into()
-                    );
-                    DW_CFA_def_cfa(out, /* rsp */ 7, 8);
-                    DW_CFA_same_value(out, 3);
-                    DW_CFA_same_value(out, 12);
-                    DW_CFA_same_value(out, 13);
-                    DW_CFA_same_value(out, 14);
-                },
             )
+            .add_fde(code_mem as u64, code.len() as u64, |out: &mut Vec<u8>| {
+                let mut ip = 0u64;
+                macro_rules! advance_to {
+                    ($fun: ident[$width: ident], $x: expr) => {{
+                        let _x: u64 = $x;
+                        let advance = _x - ip;
+                        $fun(out, advance as $width);
+                        ip += advance;
+                    }};
+                }
+
+                advance_to!(
+                    DW_CFA_advance_loc[u8],
+                    result.new_instruction_offsets[function_enter_ins].into()
+                );
+                DW_CFA_def_cfa_offset(out, 16);
+                DW_CFA_offset(out, /* rbp */ 6, 2);
+
+                DW_CFA_offset(out, 3, 3);
+                DW_CFA_offset(out, 12, 4);
+                DW_CFA_offset(out, 13, 5);
+                DW_CFA_offset(out, 14, 6);
+
+                DW_CFA_def_cfa_register(out, /* rbp */ 6);
+                advance_to!(
+                    DW_CFA_advance_loc4[u32],
+                    result.new_instruction_offsets[function_leave_ins].into()
+                );
+                DW_CFA_def_cfa(out, /* rsp */ 7, 8);
+                DW_CFA_same_value(out, 3);
+                DW_CFA_same_value(out, 12);
+                DW_CFA_same_value(out, 13);
+                DW_CFA_same_value(out, 14);
+            })
+            .build()
             .into_boxed_slice();
             // println!("{:?}", frame.as_ptr());
             // walk_eh_frame_fdes(&frame[..], |offset| {
@@ -1109,10 +1106,10 @@ impl Compiler {
                 })
                 .collect();
 
-            eprintln!("new executable at 0x{:x}", code_mem as u64);
-            for (start, (end, span)) in (&source_map as &BTreeMap<u64, (u64, SourceSpan)>).iter() {
-                eprintln!("0x{start:x}-0x{end:x} -> {span:?}")
-            }
+            // eprintln!("new executable at 0x{:x}", code_mem as u64);
+            // for (start, (end, span)) in (&source_map as &BTreeMap<u64, (u64, SourceSpan)>).iter() {
+            //     eprintln!("0x{start:x}-0x{end:x} -> {span:?}")
+            // }
 
             let rc = Rc::new(Executable {
                 _closure: closure,
@@ -1125,4 +1122,37 @@ impl Compiler {
             Ok(rc)
         }
     }
+}
+
+pub static mut COMPILER: Compiler = Compiler::new();
+
+unsafe extern "C" fn jit_personality(
+    version: std::ffi::c_int,
+    actions: std::ffi::c_int,
+    exception_class: u64,
+    exception: *const _Unwind_Exception,
+    context: *const _Unwind_Context,
+) -> _Unwind_Reason_Code {
+    assert_eq!(version, 1);
+    if actions & _UA_SEARCH_PHASE > 0 {
+        let cfa = _Unwind_GetCFA(context);
+        let region_start = _Unwind_GetRegionStart(context);
+        let ip = _Unwind_GetIP(context);
+        let span = COMPILER.source_span_for(ip);
+
+        if exception_class == NIX_EXCEPTION_CLASS {
+            let exception = &mut *(exception as *mut NixException);
+            if let Some(span) = span {
+                exception.stacktrace.push(span);
+            }
+        }
+    }
+
+    if actions & _UA_CLEANUP_PHASE > 0 {
+        // TODO: Cleanup stack
+        //       This requires saving more information in unwind data.
+        //       (we need to know when the stack pointer was when the unwind happened)
+    }
+
+    _URC_CONTINUE_UNWIND
 }

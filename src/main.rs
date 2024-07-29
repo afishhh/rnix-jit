@@ -8,10 +8,18 @@
 
 use core::panic;
 use std::{
-    arch::{asm, global_asm}, cell::UnsafeCell, collections::{BTreeMap, HashMap, HashSet}, env::VarError, fmt::{Debug, Display, Write}, mem::{offset_of, MaybeUninit}, ops::Deref, path::PathBuf, rc::Rc
+    arch::{asm, global_asm},
+    cell::UnsafeCell,
+    collections::{BTreeMap, HashMap, HashSet},
+    env::VarError,
+    fmt::{Debug, Display, Write},
+    mem::{offset_of, ManuallyDrop, MaybeUninit},
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+    rc::Rc,
 };
 
-use compiler::{Compiler, Executable};
+use compiler::{Compiler, Executable, COMPILER};
 use dwarf::*;
 use regex::Regex;
 use rnix::{
@@ -459,201 +467,9 @@ enum Parameter {
 
 mod dwarf;
 
-fn dwarf_align(data: &mut Vec<u8>, start: usize) {
-    let real_length = data.len() - start;
-    let aligned_length = real_length.next_multiple_of(8);
-    data[start..start + 4].copy_from_slice(&((aligned_length - 4) as u32).to_le_bytes());
-    for _ in real_length..aligned_length {
-        DW_CFA_nop(data);
-    }
-}
-
-mod sysvunwind;
-use sysvunwind::*;
-
-const NIX_EXCEPTION_CLASS_SLICE: &[u8; 8] = b"FSH\0NIX\0";
-const NIX_EXCEPTION_CLASS: u64 = u64::from_le_bytes(*NIX_EXCEPTION_CLASS_SLICE);
-
-#[repr(C)]
-struct NixException {
-    base: _Unwind_Exception,
-    pub message: String,
-    pub stacktrace: Vec<SourceSpan>,
-}
-
-impl NixException {
-    pub fn new(message: String) -> Box<Self> {
-        println!("0x{:?}", Self::cleanup as u64);
-        Box::new(Self {
-            base: _Unwind_Exception::new(NIX_EXCEPTION_CLASS, Self::cleanup),
-            message,
-            stacktrace: vec![],
-        })
-    }
-
-    pub fn raise(self: Box<Self>) -> ! {
-        let result =
-            unsafe { _Unwind_RaiseException(&mut Box::leak(self).base as *mut _Unwind_Exception) };
-        println!("NixException::raise: _Unwind_RaiseException failed: {result:?}");
-        std::process::abort();
-    }
-
-    unsafe extern "C" fn cleanup(code: _Unwind_Reason_Code, object: *mut _Unwind_Exception) {
-        let this = object as *mut NixException;
-        drop(Box::from_raw(object as *mut NixException));
-    }
-}
-
-#[no_mangle]
-unsafe extern "C" fn eh_personality(
-    version: std::ffi::c_int,
-    actions: std::ffi::c_int,
-    exception_class: u64,
-    exception: *const _Unwind_Exception,
-    context: *const _Unwind_Context,
-) -> _Unwind_Reason_Code {
-    assert_eq!(version, 1);
-    println!(
-        "EH PERSONALITY CALLED SEARCH:{} CLEANUP:{} -> _URC_CONTINUE_UNWIND",
-        actions & _UA_SEARCH_PHASE > 0,
-        actions & _UA_CLEANUP_PHASE > 0
-    );
-    if actions & _UA_SEARCH_PHASE > 0 {
-        let cfa = _Unwind_GetCFA(context);
-        let region_start = _Unwind_GetRegionStart(context);
-        let ip = _Unwind_GetIP(context);
-        println!("cfa = 0x{:x}", cfa);
-        println!("region start = 0x{:x}", region_start);
-        println!("ip = {} 0x{:x}", ip, ip);
-        let span = COMPILER.source_span_for(ip);
-        println!("source span = {:?}", span);
-
-        if let Some(ref span) = span {
-            let source = &span.file.content;
-            let span_line_start = source[..span.range.start().into()]
-                .rfind('\n')
-                .map(|x| x + 1)
-                .unwrap_or(0);
-            let span_line_end = source[span.range.end().into()..]
-                .find('\n')
-                .map(|x| x + Into::<usize>::into(span.range.end()))
-                .unwrap_or(source.len());
-            println!("{}", &source[span_line_start..span_line_end]);
-        }
-
-        if exception_class == NIX_EXCEPTION_CLASS {
-            let exception = &mut *(exception as *mut NixException);
-            if let Some(span) = span {
-                exception.stacktrace.push(span);
-            }
-        }
-    }
-
-    if actions & _UA_CLEANUP_PHASE > 0 {
-        // TODO: Cleanup stack
-        //       This requires saving more information in unwind data.
-        //       (we need to know when the stack pointer was when the unwind happened)
-    }
-
-    _URC_CONTINUE_UNWIND
-}
-
-#[derive(Debug)]
-struct Fde {
-    initial_location: u64,
-    address_range: u64,
-}
-
-fn create_eh_frame(
-    fdes: impl IntoIterator<Item = Fde>,
-    code_alignment_factor: u64,
-    data_alignment_factor: i64,
-    cie_instruction_builder: impl FnOnce(&mut Vec<u8>),
-    fde_instruction_builder: impl Fn(usize, &Fde, &mut Vec<u8>),
-) -> Vec<u8> {
-    let mut data = vec![];
-
-    // CIE
-    {
-        // length
-        data.extend([0u8; 4]);
-        // CIE_id
-        data.extend(0u32.to_le_bytes());
-        // version
-        data.push(1);
-        // augmentation
-        data.extend(b"zP\0");
-        // code_alignment_factor
-        uleb128(&mut data, code_alignment_factor);
-        // data_alignment_factor
-        sleb128(&mut data, data_alignment_factor);
-        // return_address_register
-        data.push(16);
-        // leb128(&mut data, /* "Return adddress RA" */ 16);
-        // optional CIE augmentation section
-        uleb128(&mut data, 9);
-        data.push(0x00); // absolute pointer
-        data.extend((eh_personality as u64).to_le_bytes());
-        // initial_instructions
-        cie_instruction_builder(&mut data);
-    }
-
-    dwarf_align(&mut data, 0);
-    // dbg!(&data, data.len());
-
-    // FDEs
-    {
-        for (i, fde) in fdes.into_iter().enumerate() {
-            // eprintln!("fde {i} starts at address offset {}", data.len());
-            let fde_start = data.len();
-            // length
-            data.extend([0u8; 4]);
-            // CIE_pointer
-            data.extend((data.len() as u32).to_le_bytes());
-            // initial_location
-            data.extend(fde.initial_location.to_le_bytes());
-            // address_range
-            data.extend(fde.address_range.to_le_bytes());
-            // fde augmentation section
-            uleb128(&mut data, 0);
-            // call frame instructions
-            // let fde_program_start = data.len();
-            fde_instruction_builder(i, &fde, &mut data);
-            // eprintln!("program for fde {i} is {:?}", &data[fde_program_start..]);
-            dwarf_align(&mut data, fde_start);
-            // eprintln!("fde {:?}", &data[fde_start..])
-        }
-    }
-
-    // libgcc detects the end of an .eh_frame section via the presence of a zero-length FDE
-    // see https://github.com/llvm/llvm-project/blob/1055c5e1d316164c70e0c9f016411a28f3b4792e/llvm/lib/ExecutionEngine/Orc/TargetProcess/RegisterEHFrames.cpp#L128
-    data.extend([0, 0, 0, 0]);
-
-    data
-}
-
-// This will be useful when supporting non-libgcc unwinders
-// (i.e. libunwind which doesn't accept whole .eh_frame sections but single FDEs)
-#[allow(dead_code)]
-fn walk_eh_frame_fdes(eh_frame: &[u8], callback: impl Fn(usize)) {
-    let mut offset = 0;
-    while offset < eh_frame.len() {
-        let current = &eh_frame[offset..];
-        let len = u32::from_le_bytes(current[0..4].try_into().unwrap()) as usize;
-        if len == 0 {
-            offset += 4;
-            break;
-        }
-        let cie_pointer = u32::from_le_bytes(current[4..8].try_into().unwrap());
-        if cie_pointer == 0 {
-            // is a cie
-        } else {
-            callback(offset);
-        }
-        offset += len + 4;
-    }
-    assert_eq!(offset, eh_frame.len());
-}
+mod exception;
+mod unwind;
+use exception::*;
 
 mod compiler;
 
@@ -1369,7 +1185,6 @@ fn create_root_scope() -> *mut Scope {
 
     let throw_function = UnpackedValue::new_function(|message| {
         let message = extract_typed!("throw", String(move message));
-        println!("builtins.throw called");
         NixException::new(Rc::unwrap_or_clone(message)).raise()
     })
     .pack();
@@ -2167,8 +1982,6 @@ thread_local! {
     static ROOT_SCOPE: *mut Scope = create_root_scope();
 }
 
-static mut COMPILER: Compiler = Compiler::new();
-
 fn import(path: PathBuf) -> Value {
     let (path, expr) = match std::fs::read_to_string(&path) {
         Err(e) if e.to_string().contains("Is a directory") => {
@@ -2246,84 +2059,16 @@ fn scope_from_map_get_works() {
     }
 }
 
-// fn dwarf_testing() {
-//     let function = unsafe {
-//         COMPILER
-//             .compile(
-//                 Program {
-//                     operations: vec![
-//                         Operation::SourceSpanPush(SourceSpan {
-//                             file: Rc::new("xd2.nix".to_string()),
-//                             range: TextRange::new(0.into(), 20.into()),
-//                         }),
-//                         Operation::Push(Value::NULL),
-//                         Operation::Push(
-//                             UnpackedValue::new_function(|_| {
-//                                 let mut a = vec![2, 4, 1, 6, 7];
-//                                 a.sort();
-//                                 println!("{a:?}");
-//                                 let exception = _Unwind_Exception::new(
-//                                     NIX_EXCEPTION_CLASS,
-//                                     nix_exception_cleanup,
-//                                 );
-//                                 let result = unsafe {
-//                                     _Unwind_RaiseException(&exception as *const _Unwind_Exception)
-//                                 };
-//                                 eprintln!("_Unwind_RaiseException: {result:?}");
-//                                 std::process::abort()
-//                             })
-//                             .pack(),
-//                         ),
-//                         Operation::Apply,
-//                         Operation::SourceSpanPop,
-//                     ],
-//                 },
-//                 None,
-//             )
-//             .unwrap()
-//     };
-//     let executable = unsafe {
-//         COMPILER
-//             .compile(
-//                 Program {
-//                     operations: vec![
-//                         Operation::SourceSpanPush(SourceSpan {
-//                             file: Rc::new("xd.nix".to_string()),
-//                             range: TextRange::new(10.into(), 20.into()),
-//                         }),
-//                         Operation::Push(Value::NULL),
-//                         Operation::Push(
-//                             UnpackedValue::Function(Rc::new(Function {
-//                                 call: function.code(),
-//                                 _executable: None,
-//                                 builtin_closure: None,
-//                                 parent_scope: std::ptr::null_mut(),
-//                             }))
-//                             .pack(),
-//                         ),
-//                         Operation::Apply,
-//                         Operation::SourceSpanPop,
-//                     ],
-//                 },
-//                 None,
-//             )
-//             .unwrap()
-//     };
-//     // std::panic::catch_unwind(|| {
-//     let result = executable.run(std::ptr::null_mut(), &Value::NULL);
-//     println!("{result:?}");
-//     std::process::abort();
-//     // })
-//     // .unwrap_or(())
-// }
-// dwarf_testing();
-
 fn main() {
     let value = import(PathBuf::from(std::env::args().nth(1).unwrap()));
     println!("--- SEQ ---");
-    std::panic::catch_unwind(move || {
+    match catch_nix_unwind(move || {
         seq(&value, true);
-        println!("{}", value);
-    })
-    .unwrap();
+        value
+    }) {
+        Ok(value) => println!("{value:?}"),
+        Err(exception) => {
+            eprintln!("unhandled nix exception: {exception:?}")
+        }
+    }
 }
