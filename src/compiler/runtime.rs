@@ -162,7 +162,6 @@ pub unsafe extern "C-unwind" fn attrset_set(
     map.insert(
         Rc::unwrap_or_clone(name),
         UnpackedValue::Lazy(LazyValue::from_jit(scope, {
-            println!("value: {:?}", value);
             Rc::increment_strong_count(value);
             Rc::from_raw(value)
         }))

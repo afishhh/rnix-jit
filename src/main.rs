@@ -2061,14 +2061,72 @@ fn scope_from_map_get_works() {
 
 fn main() {
     let value = import(PathBuf::from(std::env::args().nth(1).unwrap()));
-    println!("--- SEQ ---");
     match catch_nix_unwind(move || {
         seq(&value, true);
         value
     }) {
         Ok(value) => println!("{value:?}"),
         Err(exception) => {
-            eprintln!("unhandled nix exception: {exception:?}")
+            eprintln!("\x1b[31;1merror:\x1b[0m {}", exception.message);
+            eprintln!("backtrace (most recent first):");
+            for (i, span) in exception.stacktrace.into_iter().enumerate() {
+                let source = &span.file.content;
+
+                let span_line_start = source[..span.range.start().into()]
+                    .rfind('\n')
+                    .map(|x| x + 1)
+                    .unwrap_or(0);
+                let span_line_end = source[span.range.end().into()..]
+                    .find('\n')
+                    .map(|x| x + Into::<usize>::into(span.range.end()))
+                    .unwrap_or(source.len());
+
+                let nlines = source[span_line_start..span_line_end]
+                    .chars()
+                    .filter(|c| *c == '\n')
+                    .count()
+                    + 1;
+                let lineno = source[..span.range.start().into()]
+                    .chars()
+                    .filter(|x| *x == '\n')
+                    .count()
+                    + 1;
+                let colno = Into::<usize>::into(span.range.start()) - span_line_start + 1;
+                let final_line_index = source[..span.range.end().into()]
+                    .rfind('\n')
+                    .map(|x| x + 1)
+                    .unwrap_or(0);
+                let end_colno = Into::<usize>::into(span.range.end()) - final_line_index;
+                let end_offset = if final_line_index == span_line_start {
+                    end_colno - colno + 1
+                } else {
+                    end_colno
+                };
+
+                eprintln!("\t{i}: {}:{}:{}", span.file.filename, lineno, colno);
+                let mut is_highlighted = false;
+                for (i, mut line) in source[span_line_start..span_line_end].lines().enumerate() {
+                    eprint!("\t{:>6}|", i + lineno);
+                    if i == 0 {
+                        eprint!("{}\x1b[33m", &line[..colno - 1]);
+                        line = &line[colno - 1..];
+                        is_highlighted = true;
+                    }
+
+                    if is_highlighted {
+                        eprint!("\x1b[33m");
+                    }
+
+                    if i == nlines - 1 {
+                        eprint!("{}\x1b[0m", &line[..end_offset]);
+                        line = &line[end_offset..];
+                        is_highlighted = false;
+                    }
+
+                    eprintln!("{}\x1b[0m", line);
+                }
+                eprintln!()
+            }
         }
     }
 }

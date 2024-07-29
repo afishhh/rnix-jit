@@ -1144,6 +1144,8 @@ unsafe extern "C" fn jit_personality(
             let exception = &mut *(exception as *mut NixException);
             if let Some(span) = span {
                 exception.stacktrace.push(span);
+            } else {
+                eprintln!("WARNING: jit_personality: span not found for ip 0x{:x}", ip)
             }
         }
     }
