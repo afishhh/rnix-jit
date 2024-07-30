@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    dwarf::*, unwind::*, exception::*, Function, Operation, Parameter, Program, Scope, SourceSpan, Value,
-    ValueKind, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH,
+    dwarf::*, exception::*, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan,
+    Value, ValueKind, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -1135,8 +1135,6 @@ unsafe extern "C" fn jit_personality(
 ) -> _Unwind_Reason_Code {
     assert_eq!(version, 1);
     if actions & _UA_SEARCH_PHASE > 0 {
-        let cfa = _Unwind_GetCFA(context);
-        let region_start = _Unwind_GetRegionStart(context);
         let ip = _Unwind_GetIP(context);
         let span = COMPILER.source_span_for(ip);
 

@@ -203,7 +203,10 @@ pub unsafe extern "C-unwind" fn attrset_get(
     })
 }
 
-pub unsafe extern "C-unwind" fn attrset_get_or_insert_attrset(map: &mut ValueMap, name: Value) -> Value {
+pub unsafe extern "C-unwind" fn attrset_get_or_insert_attrset(
+    map: &mut ValueMap,
+    name: Value,
+) -> Value {
     let UnpackedValue::String(name) = name.unpack() else {
         panic!("GetAttr called with non-string name")
     };

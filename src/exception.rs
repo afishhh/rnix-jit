@@ -28,8 +28,7 @@ impl NixException {
         std::process::abort();
     }
 
-    unsafe extern "C" fn cleanup(code: _Unwind_Reason_Code, object: *mut _Unwind_Exception) {
-        let this = object as *mut NixException;
+    unsafe extern "C" fn cleanup(_code: _Unwind_Reason_Code, object: *mut _Unwind_Exception) {
         drop(Box::from_raw(object as *mut NixException));
     }
 }
@@ -41,6 +40,11 @@ impl Debug for NixException {
             .field("stacktrace", &self.stacktrace)
             .finish()
     }
+}
+
+#[macro_export]
+macro_rules! throw {
+    ($($args: tt)*) => { NixException::new(format!($($args)*)).raise() };
 }
 
 global_asm!(
@@ -89,6 +93,7 @@ unsafe extern "C" fn catch_nix_unwind_personality(
     exception: *const _Unwind_Exception,
     context: *const _Unwind_Context,
 ) -> _Unwind_Reason_Code {
+    assert_eq!(version, 1);
     if actions & _UA_FORCE_UNWIND > 0 {
         _URC_CONTINUE_UNWIND
     } else if actions & _UA_SEARCH_PHASE > 0 {
@@ -155,6 +160,10 @@ static INIT_CATCH_NIX_UNWIND: OnceLock<RegisteredFrame> = OnceLock::new();
 
 // TODO: This function makes the return value go through the heap
 //       It should not be called often but maybe there's a better way?
+//       The better way: a union on this function's stack that can be either F or
+//       Result<T, NixException>. Implementing this requires passing some more values to the
+//       unwind handler though.
+//       Using std::intrinsics::catch_unwind is also an (unstable) option.
 // SAFETY: Pretty unsafe
 pub fn catch_nix_unwind<T, F: FnOnce() -> T>(function: F) -> Result<T, NixException> {
     INIT_CATCH_NIX_UNWIND.get_or_init(rnix_jit_catch_nix_unwind_init);
