@@ -3,7 +3,8 @@ use std::{
 };
 
 use crate::{
-    throw, Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value, ValueList, ValueMap,
+    throw, Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value, ValueList,
+    ValueMap,
 };
 
 use super::{CompiledParameter, Executable};
@@ -120,7 +121,7 @@ pub unsafe extern "C-unwind" fn map_inherit_from(
         map.insert(
             key.to_string(),
             UnpackedValue::Lazy(LazyValue::from_closure(move || {
-                let value = from.run(scope, &Value::NULL).unpack().evaluate();
+                let value = from.run(scope, &Value::NULL).unpack().into_evaluated();
                 let UnpackedValue::Attrset(attrs) = value else {
                     panic!("map_inherit_from: not an attrset");
                 };
@@ -191,7 +192,6 @@ pub unsafe extern "C-unwind" fn attrset_get(
     scope: *mut Scope,
     fallback: *const Executable,
 ) -> Value {
-    let names = std::slice::from_raw_parts(values, components);
     let mut current = values.add(components).read();
     for i in 0..components {
         let UnpackedValue::String(name) = values.add(i).read().into_unpacked() else {
