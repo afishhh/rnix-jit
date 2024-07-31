@@ -47,9 +47,6 @@ macro_rules! extract_typed {
     (@impl UnpackedValue($($value: tt)*); $fmtstr: expr $(, $($fmtrest: tt)*)?) => {
         extract_typed!(@evaluate_value $($value)*).unpack()
     };
-    (@impl Value($($value: tt)*); $fmtstr: expr $(, $($fmtrest: tt)*)?) => {
-        extract_typed!(@evaluate_value $($value)*)
-    };
     (@impl $what: ident($($value: tt)*); $fmtstr: expr $(, $($fmtrest: tt)*)?) => {
         match extract_typed!(@evaluate_value $($value)*).unpack() {
             UnpackedValue::$what(ptr) => ptr,
@@ -86,11 +83,12 @@ macro_rules! make_builtin {
         Into::into($body)
     }};
     (@cast_args $fnname: expr; $n: expr;) => { };
+    (@cast_arg $fnname: expr; $n: expr; $name: ident: Value; $how: ident) => {};
     (@cast_arg $fnname: expr; $n: expr; $name: ident: $ty: ident; $how: ident) => {
         let $name = extract_typed!(
             $ty($how $name);
             concat!(
-                "expected {2}{3} argument to builtin \"", $fnname, "\" to be {0} but it evaluated to {1}",
+                "expected {2}{3} argument to builtin \"", $fnname, "\" to be {1} but it evaluated to {0}",
             ),
             const { $n },
             english_ordinal_number_suffix($n)
@@ -188,7 +186,7 @@ pub fn create_root_scope() -> *mut Scope {
         #[toplevel_alias]
         fn toString(value: UnpackedValue) {
             match value {
-                UnpackedValue::Integer(_) => todo!(),
+                UnpackedValue::Integer(i) => i.to_string().into(),
                 UnpackedValue::Bool(v) => if v { "1" } else { "0" }.to_string().into(),
                 UnpackedValue::List(_) => todo!(),
                 UnpackedValue::Attrset(_) => todo!(),
@@ -206,8 +204,21 @@ pub fn create_root_scope() -> *mut Scope {
         }
 
         #[toplevel_alias]
+        fn __dbg(message: Value, ret: Value) {
+            println!("dbg: {message:?}");
+            ret
+        }
+
+        #[toplevel_alias]
+        fn __dbgVal(message: Value) {
+            seq(&message, true);
+            println!("dbg: {message:?}");
+            message
+        }
+
+        #[toplevel_alias]
         fn throw(message: String) {
-            NixException::new(Rc::unwrap_or_clone(message)).raise() as Value
+            NixException::boxed(Rc::unwrap_or_clone(message)).raise() as Value
         }
 
         fn filter(filter: Value, list: List) {
@@ -414,9 +425,21 @@ pub fn create_root_scope() -> *mut Scope {
         //        but that would make the potential type error appear too early (not lazy enough).
         #[rename = "match"]
         fn match_(regex: String, haystack: String) {
-            Regex::new(&regex)
+            if let Some(captures) = Regex::new(&regex)
                 .unwrap_or_else(|e| throw!("failed to compile regex passed to builtins.match: {e}"))
-                .is_match(haystack.as_str())
+                .captures(haystack.as_str())
+            {
+                captures
+                    .iter()
+                    .skip(1)
+                    .map(|c| {
+                        c.map(|m| m.as_str().to_string().into())
+                            .unwrap_or(Value::NULL)
+                    })
+                    .collect::<Value>()
+            } else {
+                Value::NULL
+            }
         }
 
         fn split(regex: String, haystack: String) {
@@ -432,7 +455,7 @@ pub fn create_root_scope() -> *mut Scope {
                     captures
                         .iter()
                         .skip(1)
-                        .filter_map(|x| x)
+                        .flatten()
                         .map(|x| {
                             UnpackedValue::new_string(haystack[x.start()..x.end()].to_string())
                                 .pack()

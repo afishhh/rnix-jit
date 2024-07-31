@@ -10,13 +10,16 @@ use core::panic;
 use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
-    fmt::{Debug, Display, Write},
+    ffi::CStr,
+    fmt::{Debug, Display, Write as FmtWrite},
     mem::{offset_of, MaybeUninit},
     ops::Deref,
     path::PathBuf,
+    process::ExitCode,
     rc::Rc,
 };
 
+use clap::{Parser, Subcommand};
 use compiler::Executable;
 use dwarf::*;
 use rnix::{
@@ -44,10 +47,15 @@ enum Operation {
     Push(Value),
     // This is different from Push because this also sets the parent scope of the function
     PushFunction(Parameter, Program),
-    CreateAttrset { rec: bool },
+    CreateAttrset {
+        rec: bool,
+    },
     InheritAttrs(Option<Program>, Vec<String>),
     SetAttrpath(usize, Program),
-    GetAttrConsume { default: Option<Program> },
+    GetAttrConsume {
+        components: usize,
+        default: Option<Program>,
+    },
     HasAttrpath(usize),
     PushList,
     ListAppend(Program),
@@ -62,15 +70,15 @@ enum Operation {
     Sub,
     Mul,
     Div,
-    And,
-    Or,
+    And(Program),
+    Or(Program),
     Less,
     LessOrEqual,
     MoreOrEqual,
     More,
     Equal,
     NotEqual,
-    Implication,
+    Implication(Program),
     Apply,
     ScopePush,
     ScopeInherit(Option<Program>, Vec<String>),
@@ -218,14 +226,11 @@ impl IRCompiler {
             }
             Expr::Select(x) => {
                 self.build_program(x.expr().unwrap(), program);
-                for attr in x.attrpath().unwrap().attrs() {
-                    program.operations.push(Operation::Push(
-                        UnpackedValue::new_string(attr.to_string()).pack(),
-                    ));
-                    program.operations.push(Operation::GetAttrConsume {
-                        default: x.default_expr().map(|expr| self.create_program(expr)),
-                    })
-                }
+                let n = self.build_attrpath(x.attrpath().unwrap(), program);
+                program.operations.push(Operation::GetAttrConsume {
+                    components: n,
+                    default: x.default_expr().map(|expr| self.create_program(expr)),
+                })
             }
             Expr::Str(x) => self.build_string(x.normalized_parts(), |x| x, false, program),
             Expr::Path(x) => self.build_string(x.parts(), |x| x.syntax().text(), true, program),
@@ -299,7 +304,12 @@ impl IRCompiler {
             }
             Expr::BinOp(x) => {
                 self.build_program(x.lhs().unwrap(), program);
-                self.build_program(x.rhs().unwrap(), program);
+                match x.operator().unwrap() {
+                    rnix::ast::BinOpKind::And
+                    | rnix::ast::BinOpKind::Or
+                    | rnix::ast::BinOpKind::Implication => (),
+                    _ => self.build_program(x.rhs().unwrap(), program),
+                };
                 program.operations.push(match x.operator().unwrap() {
                     rnix::ast::BinOpKind::Concat => Operation::Concat,
                     rnix::ast::BinOpKind::Update => Operation::Update,
@@ -307,15 +317,21 @@ impl IRCompiler {
                     rnix::ast::BinOpKind::Sub => Operation::Sub,
                     rnix::ast::BinOpKind::Mul => Operation::Mul,
                     rnix::ast::BinOpKind::Div => Operation::Div,
-                    rnix::ast::BinOpKind::And => Operation::And,
                     rnix::ast::BinOpKind::Equal => Operation::Equal,
-                    rnix::ast::BinOpKind::Implication => Operation::Implication,
                     rnix::ast::BinOpKind::Less => Operation::Less,
                     rnix::ast::BinOpKind::LessOrEq => Operation::LessOrEqual,
                     rnix::ast::BinOpKind::More => Operation::More,
                     rnix::ast::BinOpKind::MoreOrEq => Operation::MoreOrEqual,
                     rnix::ast::BinOpKind::NotEqual => Operation::NotEqual,
-                    rnix::ast::BinOpKind::Or => Operation::Or,
+                    rnix::ast::BinOpKind::And => {
+                        Operation::And(self.create_program(x.rhs().unwrap()))
+                    }
+                    rnix::ast::BinOpKind::Or => {
+                        Operation::Or(self.create_program(x.rhs().unwrap()))
+                    }
+                    rnix::ast::BinOpKind::Implication => {
+                        Operation::Implication(self.create_program(x.rhs().unwrap()))
+                    }
                 })
             }
             Expr::Paren(x) => self.build_program(x.expr().unwrap(), program),
@@ -429,7 +445,7 @@ impl Scope {
                 None => {
                     scope = (*scope).previous;
                     if scope.is_null() {
-                        panic!("identifier {name} not found")
+                        throw!("identifier {name} not found")
                     }
                 }
             }
@@ -452,6 +468,7 @@ impl Deref for Scope {
         unsafe { &*self.values }
     }
 }
+
 #[derive(Debug)]
 enum Parameter {
     Ident(String),
@@ -767,7 +784,7 @@ impl UnpackedValue {
     fn fmt_attrset_display(
         map: &ValueMap,
         depth: usize,
-        f: &mut impl Write,
+        f: &mut impl FmtWrite,
         debug: bool,
     ) -> std::fmt::Result {
         writeln!(f, "{{")?;
@@ -792,7 +809,7 @@ impl UnpackedValue {
     fn fmt_list_display(
         list: &[Value],
         depth: usize,
-        f: &mut impl Write,
+        f: &mut impl FmtWrite,
         debug: bool,
     ) -> std::fmt::Result {
         if list.len() > 2 {
@@ -825,7 +842,7 @@ impl UnpackedValue {
         write!(f, "]")
     }
 
-    fn fmt_display_rec(&self, depth: usize, f: &mut impl Write) -> std::fmt::Result {
+    fn fmt_display_rec(&self, depth: usize, f: &mut impl FmtWrite) -> std::fmt::Result {
         match self {
             Self::Integer(value) => {
                 write!(f, "{value}")
@@ -859,7 +876,7 @@ impl UnpackedValue {
         }
     }
 
-    fn fmt_debug_rec(&self, depth: usize, f: &mut impl Write) -> std::fmt::Result {
+    fn fmt_debug_rec(&self, depth: usize, f: &mut impl FmtWrite) -> std::fmt::Result {
         match self {
             Self::Integer(value) => {
                 write!(f, "{value}")
@@ -912,6 +929,14 @@ impl Value {
     const NULL: Value = Value(ATTRSET_TAG_NULL);
     const TRUE: Value = Value(0b1000 | ValueKind::Bool as u64);
     const FALSE: Value = Value(ValueKind::Bool as u64);
+
+    const fn from_bool(value: bool) -> Value {
+        if value {
+            return Value::TRUE;
+        } else {
+            return Value::FALSE;
+        }
+    }
 
     fn kind(&self) -> ValueKind {
         match self.0 & ATTRSET_TAG_MASK {
@@ -1050,6 +1075,32 @@ impl Value {
     pub fn is_false(&self) -> bool {
         self.0 == Self::FALSE.0
     }
+
+    pub fn equal(self, other: Value) -> Value {
+        (self == other).into()
+    }
+
+    pub fn not_equal(self, other: Value) -> Value {
+        (self != other).into()
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.unpack(), other.unpack()) {
+            (
+                UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
+                UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
+            ) => self.0 == other.0,
+            (UnpackedValue::String(a), UnpackedValue::String(b)) => a == b,
+            (a, b) if a.kind() != b.kind() => false,
+            (a, b) => throw!(
+                "== is not supported between values of type {} and {}",
+                a.kind(),
+                b.kind()
+            ),
+        }
+    }
 }
 
 macro_rules! value_impl_binary_operator {
@@ -1106,11 +1157,6 @@ impl Value {
         <=less_or_equal(a, b) { Integer => a <= b, String => a <= b };
         >=greater_or_equal(a, b) { Integer => a >= b, String => a >= b };
         >greater(a, b) { Integer => a > b, String => a > b };
-        ==equal(a, b) { Integer => a == b, String => a == b };
-        !=not_equal(a, b) { Integer => a != b, String => a != b };
-        &&and(a, b) { Bool => a && b };
-        ||or(a, b) { Bool => a || b };
-        ->implication(a, b) { Bool => if a { b } else { true } };
     }
 }
 
@@ -1136,101 +1182,165 @@ impl Debug for Value {
 }
 
 mod builtins;
-use builtins::{import, seq};
+use builtins::{import, seq, ROOT_SCOPE};
 
-#[test]
-fn string_packing_works() {
-    assert!(matches!(
-        UnpackedValue::new_string("hello".to_string()).pack().unpack(),
-        UnpackedValue::String(ptr) if *ptr == "hello"
-    ))
+#[derive(Parser, Clone, Debug)]
+struct Opts {
+    #[command(subcommand)]
+    command: Command,
 }
 
-#[test]
-fn scope_from_map_get_works() {
-    unsafe {
-        let s = Scope::from_map(
-            {
-                let mut m = ValueMap::new();
-                m.insert("a".to_string(), UnpackedValue::Integer(10).pack());
-                m
-            },
-            std::ptr::null_mut(),
-        );
-        assert_eq!(
-            (*s).get("a").map(|x| x.0),
-            Some(UnpackedValue::Integer(10).pack().0)
-        );
+#[derive(Subcommand, Clone, Debug)]
+enum Command {
+    Repl,
+    Eval(EvalCommand),
+}
+
+#[derive(Parser, Clone, Debug)]
+// enum groups are not currently implemented in clap
+// (issue: https://github.com/clap-rs/clap/issues/2621)
+#[group(multiple = false)]
+struct EvalCommand {
+    #[clap(short, long)]
+    file: Option<PathBuf>,
+    #[clap(short, long)]
+    expr: Option<String>,
+}
+
+fn pretty_print_exception(exception: NixException) {
+    eprintln!("\x1b[31;1merror:\x1b[0m {}", exception.message);
+    eprintln!("backtrace (most recent first):");
+    for (i, span) in exception.stacktrace.into_iter().enumerate() {
+        let source = &span.file.content;
+
+        let span_line_start = source[..span.range.start().into()]
+            .rfind('\n')
+            .map(|x| x + 1)
+            .unwrap_or(0);
+        let span_line_end = source[span.range.end().into()..]
+            .find('\n')
+            .map(|x| x + Into::<usize>::into(span.range.end()))
+            .unwrap_or(source.len());
+
+        let nlines = source[span_line_start..span_line_end]
+            .chars()
+            .filter(|c| *c == '\n')
+            .count()
+            + 1;
+        let lineno = source[..span.range.start().into()]
+            .chars()
+            .filter(|x| *x == '\n')
+            .count()
+            + 1;
+        let colno = Into::<usize>::into(span.range.start()) - span_line_start + 1;
+        let final_line_index = source[..span.range.end().into()]
+            .rfind('\n')
+            .map(|x| x + 1)
+            .unwrap_or(0);
+        let end_colno = Into::<usize>::into(span.range.end()) - final_line_index;
+        let end_offset = if final_line_index == span_line_start {
+            end_colno - colno + 1
+        } else {
+            end_colno
+        };
+
+        eprintln!("\t{i}: {}:{}:{}", span.file.filename, lineno, colno);
+        let mut is_highlighted = false;
+        for (i, mut line) in source[span_line_start..span_line_end].lines().enumerate() {
+            eprint!("\t{:>6}|", i + lineno);
+            if i == 0 {
+                eprint!("{}\x1b[33m", &line[..colno - 1]);
+                line = &line[colno - 1..];
+                is_highlighted = true;
+            }
+
+            if is_highlighted {
+                eprint!("\x1b[33m");
+            }
+
+            if i == nlines - 1 {
+                eprint!("{}\x1b[0m", &line[..end_offset]);
+                line = &line[end_offset..];
+                is_highlighted = false;
+            }
+
+            eprintln!("{}\x1b[0m", line);
+        }
+        eprintln!()
     }
 }
 
-fn main() {
-    match catch_nix_unwind(move || {
-        let value = import(PathBuf::from(std::env::args().nth(1).unwrap()));
-        seq(&value, true);
-        value
-    }) {
-        Ok(value) => println!("{value:?}"),
-        Err(exception) => {
-            eprintln!("\x1b[31;1merror:\x1b[0m {}", exception.message);
-            eprintln!("backtrace (most recent first):");
-            for (i, span) in exception.stacktrace.into_iter().enumerate() {
-                let source = &span.file.content;
+fn eval(root: PathBuf, filename: String, code: String) -> Result<Value, NixException> {
+    let parse = rnix::Root::parse(&code);
+    if !parse.errors().is_empty() {
+        let mut msg = "parse errors encountered:\n".to_string();
+        for (i, error) in parse.errors().iter().enumerate() {
+            writeln!(msg, "{}. {}", i + 1, error).unwrap();
+        }
+        return Err(NixException::new(msg));
+    }
+    let expr = parse.tree().expr().unwrap();
+    let program = IRCompiler::compile(root, filename, code, expr);
+    let executable = unsafe { compiler::COMPILER.compile(program, None).unwrap() };
+    catch_nix_unwind(move || ROOT_SCOPE.with(move |s| executable.run(*s, &Value::NULL)))
+}
 
-                let span_line_start = source[..span.range.start().into()]
-                    .rfind('\n')
-                    .map(|x| x + 1)
-                    .unwrap_or(0);
-                let span_line_end = source[span.range.end().into()..]
-                    .find('\n')
-                    .map(|x| x + Into::<usize>::into(span.range.end()))
-                    .unwrap_or(source.len());
-
-                let nlines = source[span_line_start..span_line_end]
-                    .chars()
-                    .filter(|c| *c == '\n')
-                    .count()
-                    + 1;
-                let lineno = source[..span.range.start().into()]
-                    .chars()
-                    .filter(|x| *x == '\n')
-                    .count()
-                    + 1;
-                let colno = Into::<usize>::into(span.range.start()) - span_line_start + 1;
-                let final_line_index = source[..span.range.end().into()]
-                    .rfind('\n')
-                    .map(|x| x + 1)
-                    .unwrap_or(0);
-                let end_colno = Into::<usize>::into(span.range.end()) - final_line_index;
-                let end_offset = if final_line_index == span_line_start {
-                    end_colno - colno + 1
-                } else {
-                    end_colno
-                };
-
-                eprintln!("\t{i}: {}:{}:{}", span.file.filename, lineno, colno);
-                let mut is_highlighted = false;
-                for (i, mut line) in source[span_line_start..span_line_end].lines().enumerate() {
-                    eprint!("\t{:>6}|", i + lineno);
-                    if i == 0 {
-                        eprint!("{}\x1b[33m", &line[..colno - 1]);
-                        line = &line[colno - 1..];
-                        is_highlighted = true;
-                    }
-
-                    if is_highlighted {
-                        eprint!("\x1b[33m");
-                    }
-
-                    if i == nlines - 1 {
-                        eprint!("{}\x1b[0m", &line[..end_offset]);
-                        line = &line[end_offset..];
-                        is_highlighted = false;
-                    }
-
-                    eprintln!("{}\x1b[0m", line);
+fn main() -> ExitCode {
+    let opts = Opts::parse();
+    match opts.command {
+        Command::Repl => loop {
+            let line = unsafe {
+                let line_ptr = readline_sys::readline(c"> ".as_ptr());
+                if line_ptr.is_null() {
+                    return ExitCode::SUCCESS;
                 }
-                eprintln!()
+                let line = CStr::from_ptr(line_ptr);
+                let string = line.to_str().unwrap().to_string();
+                if !line.is_empty() {
+                    readline_sys::add_history(line_ptr);
+                }
+                nix::libc::free(line.as_ptr() as *mut std::ffi::c_void);
+                string
+            };
+            match eval(std::env::current_dir().unwrap(), "<repl>".to_string(), line).and_then(
+                |value| {
+                    catch_nix_unwind(|| {
+                        seq(&value, true);
+                        value
+                    })
+                },
+            ) {
+                Ok(value) => println!("{value}"),
+                Err(exception) => pretty_print_exception(exception),
+            }
+        },
+        Command::Eval(EvalCommand { file, expr }) => {
+            match catch_nix_unwind(move || {
+                let value = if let Some(file) = file {
+                    import(file)
+                } else if let Some(expr) = expr {
+                    eval(
+                        std::env::current_dir().unwrap(),
+                        "<string>".to_string(),
+                        expr,
+                    )?
+                } else {
+                    unreachable!()
+                };
+                seq(&value, true);
+                Ok(value)
+            })
+            // me when Result::flatten is unstable
+            .and_then(|x| x)
+            {
+                Ok(value) => {
+                    println!("{value:?}");
+                    ExitCode::SUCCESS
+                }
+                Err(exception) => {
+                    pretty_print_exception(exception);
+                    ExitCode::FAILURE
+                }
             }
         }
     }

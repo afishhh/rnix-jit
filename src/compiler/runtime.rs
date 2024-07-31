@@ -2,9 +2,13 @@ use std::{
     cell::UnsafeCell, ffi::CStr, mem::ManuallyDrop, ops::Deref, path::PathBuf, ptr::NonNull, rc::Rc,
 };
 
-use crate::{Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value, ValueList, ValueMap};
+use crate::{
+    throw, Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value, ValueList, ValueMap,
+};
 
 use super::{CompiledParameter, Executable};
+
+// TODO: use extract_typed! more in this module
 
 pub unsafe extern "C-unwind" fn scope_lookup(
     scope: *mut Scope,
@@ -182,25 +186,40 @@ pub unsafe extern "C" fn attrset_inherit_parent(
 }
 
 pub unsafe extern "C-unwind" fn attrset_get(
-    map: &mut ValueMap,
-    name: Value,
+    values: *const Value,
+    components: usize,
     scope: *mut Scope,
     fallback: *const Executable,
 ) -> Value {
-    let UnpackedValue::String(name) = name.into_unpacked() else {
-        panic!("GetAttr called with non-string name")
-    };
-    map.get(name.as_str()).cloned().unwrap_or_else(|| {
-        if fallback.is_null() {
-            panic!("{map:?}.{name:?} does not exist")
-        } else {
-            LazyValue::from_jit(scope, unsafe {
-                Rc::increment_strong_count(fallback);
-                Rc::from_raw(fallback)
-            })
-        }
-        .into()
-    })
+    let names = std::slice::from_raw_parts(values, components);
+    let mut current = values.add(components).read();
+    for i in 0..components {
+        let UnpackedValue::String(name) = values.add(i).read().into_unpacked() else {
+            throw!("attribute name is not a string")
+        };
+        current = match current.into_evaluated().into_unpacked() {
+            UnpackedValue::Attrset(x) => {
+                let map = &*x.get();
+                match map.get(name.as_str()).cloned() {
+                    Some(x) => x,
+                    None => {
+                        if fallback.is_null() {
+                            throw!("{map:?}.{name:?} does not exist")
+                        } else {
+                            return LazyValue::from_jit(scope, unsafe {
+                                Rc::increment_strong_count(fallback);
+                                Rc::from_raw(fallback)
+                            })
+                            .into();
+                        }
+                    }
+                }
+            }
+            _ => throw!("not an attribute set"),
+        };
+    }
+
+    current
 }
 
 pub unsafe extern "C-unwind" fn attrset_get_or_insert_attrset(
@@ -227,7 +246,7 @@ unsafe fn attrset_hasattrpath_impl(map: &ValueMap, names: &[&String]) -> Value {
     }
 }
 
-pub unsafe extern "C" fn attrset_hasattrpath(
+pub unsafe extern "C-unwind" fn attrset_hasattrpath(
     map: &ValueMap,
     names: *const &String,
     names_len: usize,
@@ -349,4 +368,8 @@ pub unsafe extern "C-unwind" fn asm_panic_with_value(msg: *const i8, value: Valu
         value.0
     );
     panic!("jitpanic")
+}
+
+pub unsafe extern "C-unwind" fn asm_throw(msg: *const i8) {
+    throw!("{}", CStr::from_ptr(msg).to_string_lossy());
 }

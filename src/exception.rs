@@ -13,12 +13,16 @@ pub struct NixException {
 }
 
 impl NixException {
-    pub fn new(message: String) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(message: String) -> Self {
+        Self {
             base: _Unwind_Exception::new(NIX_EXCEPTION_CLASS, Self::cleanup),
             message,
             stacktrace: vec![],
-        })
+        }
+    }
+
+    pub fn boxed(message: String) -> Box<Self> {
+        Box::new(Self::new(message))
     }
 
     pub fn raise(self: Box<Self>) -> ! {
@@ -44,7 +48,7 @@ impl Debug for NixException {
 
 #[macro_export]
 macro_rules! throw {
-    ($($args: tt)*) => { NixException::new(format!($($args)*)).raise() };
+    ($($args: tt)*) => { $crate::exception::NixException::boxed(format!($($args)*)).raise() };
 }
 
 global_asm!(

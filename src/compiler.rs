@@ -99,13 +99,10 @@ pub struct Executable {
 impl Executable {
     #[inline(always)]
     pub fn run(&self, scope: *mut Scope, arg: &Value) -> Value {
-        // println!("executable at {:?} running", self.code as *const ());
-        let r = unsafe {
+        unsafe {
             asm!("mov r10, {}", in(reg) scope, out("r10") _);
             (self.code)(Value::NULL, arg.leaking_copy())
-        };
-        // println!("executable at {:?} ran", self.code as *const ());
-        r
+        }
     }
 
     #[inline(always)]
@@ -144,6 +141,38 @@ impl Drop for Executable {
             __deregister_frame(self.eh_frame.as_ptr());
         }
     }
+}
+
+// TODO: is this macro a good idea?
+macro_rules! emit_asm {
+    ($assembler: expr, { $($asm: tt)* }) => {{
+        emit_asm!(@phase1 $assembler; $($asm)*);
+        emit_asm!(@phase2 $assembler; $($asm)*);
+    }};
+    (@phase1 $asm: expr;) => {};
+    (@phase1 $asm: expr; $opcode: ident $($operand: expr),+; $($rest: tt)*) => {
+        emit_asm!(@phase1 $asm; $($rest)*);
+    };
+    (@phase1 $asm: expr; $expr: block $($rest: tt)*) => {
+        emit_asm!(@phase1 $asm; $($rest)*);
+    };
+    (@phase1 $asm: expr; $label: ident: $($rest: tt)*) => {
+        let mut $label = $asm.create_label();
+        emit_asm!(@phase1 $asm; $($rest)*);
+    };
+    (@phase2 $asm: expr;) => {};
+    (@phase2 $asm: expr; $opcode: ident $($operand: expr),+; $($rest: tt)*) => {
+        $asm.$opcode($($operand),*)?;
+        emit_asm!(@phase2 $asm; $($rest)*);
+    };
+    (@phase2 $asm: expr; { $($block: tt)* } $($rest: tt)*) => {
+        $($block)*
+        emit_asm!(@phase2 $asm; $($rest)*);
+    };
+    (@phase2 $asm: expr; $label: ident: $($rest: tt)*) => {
+        $asm.set_label(&mut $label)?;
+        emit_asm!(@phase2 $asm; $($rest)*);
+    };
 }
 
 pub struct Compiler {
@@ -305,8 +334,8 @@ impl Compiler {
                 };
             }
 
-                macro_rules! impl_binary_operator {
-                ($(int => $(retag($tag: ident))? $if_int: block,)? $(bool => $if_bool: expr,)? fallback = $other: expr) => {{
+            macro_rules! impl_binary_operator {
+                (int => $(retag($tag: ident))? $if_int: block, fallback = $other: expr) => {{
                     asm.pop(r12)?;
                     stack_values -= 1;
                     unlazy!(r12, rdi);
@@ -322,47 +351,27 @@ impl Compiler {
                     asm.mov(rdx, rsi)?;
                     asm.and(rdx, VALUE_TAG_MASK as i32)?;
 
+                    let mut not_an_integer = asm.create_label();
+
+                    asm.cmp(cl, ValueKind::Integer as i32)?;
+                    asm.jnz(not_an_integer)?;
+
+                    asm.cmp(dl, ValueKind::Integer as i32)?;
+                    asm.jnz(not_an_integer)?;
+
+                    asm.shr(rdi, VALUE_TAG_WIDTH as i32)?;
+                    asm.shr(rsi, VALUE_TAG_WIDTH as i32)?;
+                    let register = $if_int;
                     $(
-                        let mut not_an_integer = asm.create_label();
-
-                        asm.cmp(cl, ValueKind::Integer as i32)?;
-                        asm.jnz(not_an_integer)?;
-
-                        asm.cmp(dl, ValueKind::Integer as i32)?;
-                        asm.jnz(not_an_integer)?;
-
-                        asm.shr(rdi, VALUE_TAG_WIDTH as i32)?;
-                        asm.shr(rsi, VALUE_TAG_WIDTH as i32)?;
-                        let register = $if_int;
-                        $(
-                            asm.shl(register, VALUE_TAG_WIDTH as i32)?;
-                            asm.or(register, ValueKind::$tag as i32)?;
-                        )?
-
-                        asm.push(register)?;
-
-                        asm.jmp(end)?;
-
-                        asm.set_label(&mut not_an_integer)?;
+                        asm.shl(register, VALUE_TAG_WIDTH as i32)?;
+                        asm.or(register, ValueKind::$tag as i32)?;
                     )?
 
-                    $(
-                        let mut not_a_boolean = asm.create_label();
+                    asm.push(register)?;
 
-                        asm.cmp(cl, ValueKind::Bool as i32)?;
-                        asm.jnz(not_a_boolean)?;
+                    asm.jmp(end)?;
 
-                        asm.cmp(dl, ValueKind::Bool as i32)?;
-                        asm.jnz(not_a_boolean)?;
-
-                        $if_bool;
-
-                        asm.push(rdi)?;
-
-                        asm.jmp(end)?;
-
-                        asm.set_label(&mut not_a_boolean)?;
-                    )?
+                    asm.set_label(&mut not_an_integer)?;
 
                     call!(rust $other);
 
@@ -383,6 +392,45 @@ impl Compiler {
                         fallback = $fallback
                     )
                 }};
+                (boolean $second: expr, shortcircuit(rdi = $value: expr) => $sresult: expr, else(rax) => $nresult: expr) => {emit_asm!(asm, {
+                    { let second = closure.intern(self.compile($second, None)?); }
+
+                    pop rdi;
+                    {
+                        stack_values -= 1;
+                        unlazy!(rdi, rcx);
+                    }
+                    cmp rdi, Value::from_bool(!$value).0 as i32;
+                    jne shortcircuit_possible;
+
+                    mov r10, r15;
+                    { call!(rust unsafe { (*second).code }); }
+                    mov rcx, rax;
+                    and rcx, VALUE_TAG_MASK as i32;
+                    cmp rcx, ValueKind::Bool as i32;
+                    jne second_not_boolean;
+
+                    push $nresult;
+                    jmp end;
+
+                shortcircuit_possible:
+                    cmp rdi, Value::from_bool($value).0 as i32;
+                    jne first_not_boolean;
+                    { let register = $sresult; }
+                    push register;
+                    jmp end;
+
+                first_not_boolean:
+                    mov rdi, c"first operand to && operator is not a boolean".as_ptr() as u64;
+                    { call!(rust asm_throw); }
+
+                second_not_boolean:
+                    mov rdi, c"second operand to && operator is not a boolean".as_ptr() as u64;
+                    { call!(rust asm_throw); }
+
+                end:
+                    { stack_values += 1; }
+                })};
             }
 
                 macro_rules! unpack {
@@ -431,21 +479,23 @@ impl Compiler {
                         },
                         fallback = Value::div
                     ),
-                    Operation::And => impl_binary_operator!(
-                        bool => asm.and(rdi, rsi)?,
-                        fallback = Value::and
+                    Operation::And(second) => impl_binary_operator!(
+                        boolean second,
+                        shortcircuit(rdi = false) => rdi,
+                        else(rax) => rax
                     ),
-                    Operation::Or => impl_binary_operator!(
-                        bool => asm.or(rdi, rsi)?,
-                        fallback = Value::or
+                    Operation::Or(second) => impl_binary_operator!(
+                        boolean second,
+                        shortcircuit(rdi = true) => rdi,
+                        else(rax) => rax
                     ),
-                    Operation::Implication => impl_binary_operator!(
-                        bool => {
-                            asm.cmp(rdi, Value::TRUE.0 as i32)?;
+                    Operation::Implication(second) => impl_binary_operator!(
+                        boolean second,
+                        shortcircuit(rdi = false) => {
                             asm.mov(rdi, Value::TRUE.0)?;
-                            asm.cmove(rdi, rsi)?;
+                            rdi
                         },
-                        fallback = Value::implication
+                        else(rax) => rax
                     ),
                     Operation::Less => impl_binary_operator!(
                         comparison cmovl or Value::less
@@ -572,45 +622,29 @@ impl Compiler {
 
                         asm.set_label(&mut end)?;
                     }
-                    Operation::GetAttrConsume { default } => {
+                    Operation::GetAttrConsume { components, default } => {
                         let default = if let Some(program) = default {
                             closure.intern(self.compile(program, None)?)
                         } else { std::ptr::null() };
 
-                        assert!(stack_values >= 2);
-                        asm.pop(r12)?;
-                        stack_values -= 1;
-                        unlazy!(r12, rdi);
-                        asm.pop(rdi)?;
-                        stack_values -= 1;
-                        unlazy!(rdi, rcx);
-                        asm.mov(rsi, r12)?;
+                        assert!(stack_values > components);
 
-                        let mut not_an_attrset = asm.create_label();
-                        asm.mov(rcx, rdi)?;
-                        asm.and(rcx, r14)?;
-                        asm.cmp(rcx, ValueKind::Attrset as i32)?;
-                        asm.jne(not_an_attrset)?;
+                        for i in 0..=components {
+                            asm.mov(rdi, qword_ptr(rsp + 8 * i))?;
+                            unlazy!(rdi, rcx);
+                            asm.mov(qword_ptr(rsp + 8 * i), rdi)?;
+                        }
 
-                        asm.sub(rdi, ValueKind::Attrset as i32)?;
-
+                        asm.mov(rdi, rsp)?;
+                        asm.mov(rsi, components as u64)?;
                         asm.mov(rdx, r15)?;
                         asm.mov(rcx, default as u64)?;
 
                         call!(rust attrset_get);
+                        asm.add(rsp, ((components + 1) * 8) as i32)?;
                         asm.push(rax)?;
 
-                        let mut end = asm.create_label();
-                        asm.jmp(end)?;
-
-                        asm.set_label(&mut not_an_attrset)?;
-
-                        asm.mov(rsi, rdi)?;
-                        asm.mov(rdi, c"getattr called on non-attrset value".as_ptr() as u64)?;
-                        call!(rust asm_panic_with_value);
-
-                        asm.set_label(&mut end)?;
-                        stack_values += 1;
+                        stack_values -= components;
                     }
                     Operation::HasAttrpath(len) => {
                         assert!(stack_values > len);
