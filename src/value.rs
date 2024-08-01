@@ -9,7 +9,7 @@ use std::{
 
 use crate::{compiler::Executable, throw, Scope};
 
-pub(crate) struct Function {
+pub struct Function {
     pub(crate) call: unsafe extern "C-unwind" fn(Value, Value) -> Value,
     pub(crate) _executable: Option<Rc<Executable>>,
     pub(crate) builtin_closure: Option<Box<dyn FnMut(Value) -> Value>>,
@@ -100,8 +100,8 @@ impl LazyValue {
     }
 }
 
-pub(crate) type ValueMap = BTreeMap<String, Value>;
-pub(crate) type ValueList = Vec<Value>;
+pub type ValueMap = BTreeMap<String, Value>;
+pub type ValueList = Vec<Value>;
 
 #[derive(Clone)]
 pub enum UnpackedValue {
@@ -795,43 +795,44 @@ impl Debug for Value {
 #[macro_export]
 macro_rules! value {
     ([$($tt: tt)*]) => {
-        UnpackedValue::new_list(#[allow(clippy::vec_init_then_push)] {
-            let mut _result = Vec::with_capacity(value!(@listcount 0; $($tt)*));
-            value!(@list _result; $($tt)*);
+        $crate::value::UnpackedValue::new_list(#[allow(clippy::vec_init_then_push)] {
+            let mut _result = Vec::with_capacity($crate::value!(@listcount 0; $($tt)*));
+            $crate::value!(@list _result; $($tt)*);
             _result
         }).pack()
     };
     ({$($tt: tt)*}) => {
-        UnpackedValue::new_attrset({
-            let mut _result = ValueMap::new();
-            value!(@map _result; $($tt)*);
+        $crate::value::UnpackedValue::new_attrset({
+            let mut _result = $crate::value::ValueMap::new();
+            $crate::value!(@map _result; $($tt)*);
             _result
         }).pack()
     };
-    ($expr: expr) => { Value::from($expr) };
+    (null) => { $crate::value::Value::NULL };
+    ($expr: expr) => { $crate::value::Value::from($expr) };
 
     (@key [$key: expr]) => { $key };
     (@key $key: ident) => { stringify!($key).to_string() };
 
-    (@listcount $current: expr; $value: expr$(, $($rest: tt)*)?) => { value!(@listcount $current + 1; $($($rest)*)?) };
+    (@listcount $current: expr; $value: expr$(, $($rest: tt)*)?) => { $crate::value!(@listcount $current + 1; $($($rest)*)?) };
     (@listcount $current: expr;) => { $current };
     (@list $out: ident; $value: tt $(, $($rest: tt)*)?) => {
-        $out.push(value!($value));
-        value!(@list $out; $($($rest)*)?)
+        $out.push($crate::value!($value));
+        $crate::value!(@list $out; $($($rest)*)?)
     };
     (@list $out: ident; $value: expr $(, $($rest: tt)*)?) => {
-        $out.push(Value::from($value));
-        value!(@list $out; $($($rest)*)?)
+        $out.push($crate::value::Value::from($value));
+        $crate::value!(@list $out; $($($rest)*)?)
     };
     (@list $out: ident;) => { };
 
     (@map $out: ident; $key: tt = $value: tt; $($rest: tt)*) => {
-        $out.insert(value!(@key $key), value!($value));
-        value!(@map $out; $($rest)*);
+        $out.insert($crate::value!(@key $key), $crate::value!($value));
+        $crate::value!(@map $out; $($rest)*);
     };
     (@map $out: ident; $key: tt = $value: expr; $($rest: tt)*) => {
-        $out.insert(Value::from(@key $key), value!($value));
-        value!(@map $out; $($rest)*);
+        $out.insert($crate::value::Value::from(@key $key), $crate::value!($value));
+        $crate::value!(@map $out; $($rest)*);
     };
     (@map $out: ident;) => { };
 }

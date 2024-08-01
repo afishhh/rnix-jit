@@ -73,18 +73,18 @@ pub unsafe extern "C-unwind" fn create_function_scope(
     }
 }
 
-pub unsafe extern "C" fn scope_create(previous: *mut Scope) -> *mut Scope {
+pub unsafe extern "C-unwind" fn scope_create(previous: *mut Scope) -> *mut Scope {
     Scope::from_map(ValueMap::new(), previous)
 }
 
-pub unsafe extern "C" fn scope_create_rec(
+pub unsafe extern "C-unwind" fn scope_create_rec(
     attrset: *mut UnsafeCell<ValueMap>,
     previous: *mut Scope,
 ) -> *mut Scope {
     Scope::from_attrs(Rc::from_raw(attrset), previous)
 }
 
-pub unsafe extern "C" fn scope_set(
+pub unsafe extern "C-unwind" fn scope_set(
     scope: *mut Scope,
     key: *const u8,
     key_len: usize,
@@ -151,7 +151,7 @@ pub unsafe extern "C-unwind" fn scope_inherit_parent(
     }
 }
 
-pub unsafe extern "C" fn attrset_create() -> Value {
+pub unsafe extern "C-unwind" fn attrset_create() -> Value {
     UnpackedValue::new_attrset(ValueMap::new()).pack()
 }
 
@@ -174,7 +174,7 @@ pub unsafe extern "C-unwind" fn attrset_set(
     );
 }
 
-pub unsafe extern "C" fn attrset_inherit_parent(
+pub unsafe extern "C-unwind" fn attrset_inherit_parent(
     attrset: &mut ValueMap,
     from: *mut Scope,
     what: *const String,
@@ -255,7 +255,7 @@ pub unsafe extern "C-unwind" fn attrset_hasattrpath(
     attrset_hasattrpath_impl(map, names)
 }
 
-pub unsafe extern "C" fn attrset_update(left: &ValueMap, right: &ValueMap) -> Value {
+pub unsafe extern "C-unwind" fn attrset_update(left: &ValueMap, right: &ValueMap) -> Value {
     UnpackedValue::new_attrset({
         let mut result = left.clone();
         for (key, value) in right.iter() {
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn attrset_update(left: &ValueMap, right: &ValueMap) -> Va
     .pack()
 }
 
-pub unsafe extern "C" fn create_function_value(
+pub unsafe extern "C-unwind" fn create_function_value(
     executable: *const Executable,
     scope: *mut Scope,
 ) -> Value {
@@ -282,11 +282,11 @@ pub unsafe extern "C" fn create_function_value(
     .pack()
 }
 
-pub unsafe extern "C" fn list_create() -> Value {
+pub unsafe extern "C-unwind" fn list_create() -> Value {
     UnpackedValue::new_list(Vec::new()).pack()
 }
 
-pub unsafe extern "C" fn list_append_value(
+pub unsafe extern "C-unwind" fn list_append_value(
     list: &mut ValueList,
     scope: *mut Scope,
     executable: *const Executable,
@@ -300,7 +300,7 @@ pub unsafe extern "C" fn list_append_value(
     );
 }
 
-pub unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
+pub unsafe extern "C-unwind" fn list_concat(a: Value, b: Value) -> Value {
     if let (UnpackedValue::List(a), UnpackedValue::List(b)) = (a.unpack(), b.unpack()) {
         UnpackedValue::new_list(
             (*a.get())
@@ -315,7 +315,7 @@ pub unsafe extern "C" fn list_concat(a: Value, b: Value) -> Value {
     }
 }
 
-pub unsafe extern "C" fn string_mut_append(from: NonNull<String>, to: &mut String) {
+pub unsafe extern "C-unwind" fn string_mut_append(from: NonNull<String>, to: &mut String) {
     assert_ne!(from.as_ptr(), to as *mut _);
     *to += from.as_ref();
     Rc::decrement_strong_count(from.as_ptr());
@@ -325,7 +325,7 @@ pub unsafe extern "C-unwind" fn value_into_evaluated(a: *mut UnsafeCell<LazyValu
     LazyValue(Rc::from_raw(a)).evaluate().clone()
 }
 
-pub unsafe extern "C" fn value_ref(a: ManuallyDrop<Value>) -> Value {
+pub unsafe extern "C-unwind" fn value_ref(a: ManuallyDrop<Value>) -> Value {
     a.deref().clone()
 }
 
@@ -348,7 +348,7 @@ pub unsafe extern "C-unwind" fn value_string_to_mut(a: Value) -> Value {
     .pack()
 }
 
-pub unsafe extern "C" fn value_string_to_path(a: Value) -> Value {
+pub unsafe extern "C-unwind" fn value_string_to_path(a: Value) -> Value {
     match a.into_unpacked() {
         UnpackedValue::String(x) => UnpackedValue::new_path(PathBuf::from(Rc::unwrap_or_clone(x))),
         UnpackedValue::Lazy(x) => return value_string_to_path(x.evaluate().clone()),
@@ -357,7 +357,7 @@ pub unsafe extern "C" fn value_string_to_path(a: Value) -> Value {
     .pack()
 }
 
-pub unsafe extern "C" fn asm_panic(msg: *const i8) {
+pub unsafe extern "C-unwind" fn asm_panic(msg: *const i8) {
     panic!("[JITPANIC] {}", CStr::from_ptr(msg).to_string_lossy());
 }
 
