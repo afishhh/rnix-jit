@@ -5,6 +5,8 @@
 #![feature(offset_of_nested)]
 // This can be replaced later
 #![feature(offset_of_enum)]
+// Rust's comedic const eval support
+#![feature(const_float_bits_conv)]
 
 use std::{
     cell::UnsafeCell,

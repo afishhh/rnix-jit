@@ -187,6 +187,7 @@ pub fn create_root_scope() -> *mut Scope {
         fn toString(value: UnpackedValue) {
             match value {
                 UnpackedValue::Integer(i) => i.to_string().into(),
+                UnpackedValue::Double(d) => d.to_string().into(),
                 UnpackedValue::Bool(v) => if v { "1" } else { "0" }.to_string().into(),
                 UnpackedValue::List(_) => todo!(),
                 UnpackedValue::Attrset(_) => todo!(),
@@ -218,7 +219,10 @@ pub fn create_root_scope() -> *mut Scope {
 
         #[toplevel_alias]
         fn throw(message: String) {
-            NixException::boxed(Rc::unwrap_or_clone(message)).raise() as Value
+            #[allow(unreachable_code)] // From<!> is not implemented for Value
+            {
+                NixException::boxed(Rc::unwrap_or_clone(message)).raise() as Value
+            }
         }
 
         fn filter(filter: Value, list: List) {
@@ -321,7 +325,10 @@ pub fn create_root_scope() -> *mut Scope {
         }
 
         fn sort(_comparator: Value, _list: List) {
-            todo!("builtins.sort") as Value
+            #[allow(unreachable_code)] // From<!> is not implemented for Value
+            {
+                todo!("builtins.sort") as Value
+            }
         }
 
         fn concatLists(lists: List) {
@@ -664,7 +671,10 @@ pub fn create_root_scope() -> *mut Scope {
         }
 
         fn genericClosure(_args: Attrset) {
-            throw!("builtins.genericClosure is not yet implemented") as Value
+            #[allow(unreachable_code)] // From<!> is not implemented for Value
+            {
+                throw!("builtins.genericClosure is not yet implemented") as Value
+            }
         }
     );
 
@@ -701,8 +711,8 @@ pub fn create_root_scope() -> *mut Scope {
         UnpackedValue::new_string("x86_64-linux".to_string()).pack(),
     );
 
-    values.insert("true".to_string(), UnpackedValue::Bool(true).pack());
-    values.insert("false".to_string(), UnpackedValue::Bool(false).pack());
+    values.insert("true".to_string(), Value::TRUE);
+    values.insert("false".to_string(), Value::FALSE);
     values.insert("null".to_string(), UnpackedValue::Null.pack());
 
     // TODO: merge this with Value::operator methods
@@ -750,6 +760,7 @@ pub fn create_root_scope() -> *mut Scope {
 pub fn seq(value: &Value, deep: bool) {
     match value.unpack() {
         UnpackedValue::Integer(_) => (),
+        UnpackedValue::Double(_) => (),
         UnpackedValue::Bool(_) => (),
         UnpackedValue::List(value) => {
             let list = unsafe { &mut *value.get() };

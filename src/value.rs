@@ -9,37 +9,6 @@ use std::{
 
 use crate::{compiler::Executable, throw, Scope};
 
-pub(crate) const VALUE_TAG_WIDTH: u8 = 3;
-pub(crate) const VALUE_TAG_MASK: u64 = 0b111;
-pub(crate) const ATTRSET_TAG_MASK: u64 = 0b111 | (0b11 << 62);
-pub(crate) const ATTRSET_TAG_ATTRSET: u64 = ValueKind::Attrset as u64;
-pub(crate) const ATTRSET_TAG_LAZY: u64 = ValueKind::Attrset as u64 | (0b11 << 62);
-pub(crate) const ATTRSET_TAG_NULL: u64 = ValueKind::Attrset as u64 | (0b10 << 62);
-
-#[repr(u8)]
-#[derive(Debug, PartialEq, Eq)]
-pub enum ValueKind {
-    // TODO: consolidate this into some Pointer variant that stores
-    //       the pointer type in the upper byte (canonical address form x86_64 quirk)
-    // 0b11...ValueKind::Attrset = Lazy ptr
-    // 0b10...ValueKind::Attrset = NULL
-    // 0b00...ValueKind::Attrset = Attrset
-    Attrset = 0, // also used as a tag for null
-    Function,
-    Integer,
-    Double,
-    String,
-    Path,
-    List,
-    Bool,
-    // NOTE: These are no longer tag values, instead these are packed into Attrset tags
-    // FIXME: Most Values in the whole program are going to be hidden behind this extra layer of
-    //        LazyValue indirection, maybe there is a way to make the potential performance penalty
-    //        smaller?
-    Lazy, // a pointer to LazyValue
-    Null, // all zeroes: an attrset which is a null pointer
-}
-
 pub(crate) struct Function {
     pub(crate) call: unsafe extern "C-unwind" fn(Value, Value) -> Value,
     pub(crate) _executable: Option<Rc<Executable>>,
@@ -48,14 +17,14 @@ pub(crate) struct Function {
 }
 
 #[derive(Debug)]
-enum LazyValueImpl {
+pub(crate) enum LazyValueImpl {
     Evaluated(Value),
     LazyJIT((*mut Scope, Rc<Executable>)),
     LazyBuiltin(MaybeUninit<Box<dyn FnOnce() -> Value>>),
 }
 
 #[derive(Debug, Clone)]
-pub struct LazyValue(Rc<UnsafeCell<LazyValueImpl>>);
+pub struct LazyValue(pub(crate) Rc<UnsafeCell<LazyValueImpl>>);
 
 thread_local! {
     static LAZY_DEPTH: UnsafeCell<usize> = const { UnsafeCell::new(0) };
@@ -137,6 +106,7 @@ pub(crate) type ValueList = Vec<Value>;
 #[derive(Clone)]
 pub enum UnpackedValue {
     Integer(i32),
+    Double(f64),
     Bool(bool),
     List(Rc<UnsafeCell<ValueList>>),
     Attrset(Rc<UnsafeCell<ValueMap>>),
@@ -170,9 +140,21 @@ impl From<i32> for UnpackedValue {
     }
 }
 
+impl From<f64> for UnpackedValue {
+    fn from(value: f64) -> Self {
+        UnpackedValue::Double(value)
+    }
+}
+
 impl From<bool> for UnpackedValue {
     fn from(value: bool) -> Self {
         UnpackedValue::Bool(value)
+    }
+}
+
+impl<'a> From<&'a str> for UnpackedValue {
+    fn from(value: &'a str) -> Self {
+        UnpackedValue::new_string(value.to_string())
     }
 }
 
@@ -253,6 +235,7 @@ impl UnpackedValue {
     pub fn kind(&self) -> ValueKind {
         match self {
             UnpackedValue::Integer(_) => ValueKind::Integer,
+            UnpackedValue::Double(_) => ValueKind::Double,
             UnpackedValue::Bool(_) => ValueKind::Bool,
             UnpackedValue::List(_) => ValueKind::List,
             UnpackedValue::Attrset(_) => ValueKind::Attrset,
@@ -266,28 +249,31 @@ impl UnpackedValue {
 
     pub fn pack(self) -> Value {
         macro_rules! pack_ptr {
-            ($ptr: ident, $kind: ident) => {{
-                Value((Rc::into_raw($ptr) as u64) | (ValueKind::$kind as u64))
+            ($ptr: expr, $kind: ident) => {{
+                unsafe {
+                    Value::from_raw_parts(
+                        ValueKind::$kind,
+                        (Rc::into_raw($ptr) as u64) & 0xFFFF_FFFF_FFFF,
+                    )
+                }
             }};
         }
         match self {
             Self::Integer(x) => unsafe {
-                Value(
-                    ((std::mem::transmute::<i32, u32>(x) as u64) << VALUE_TAG_WIDTH)
-                        | (ValueKind::Integer as u64),
-                )
+                Value::from_raw_parts(ValueKind::Integer, std::mem::transmute::<_, u32>(x).into())
             },
-            Self::Bool(x) => Value(if x {
-                0b1000 | (ValueKind::Bool as u64)
-            } else {
-                ValueKind::Bool as u64
-            }),
+            Self::Double(x) => {
+                let bits = x.to_bits();
+                debug_assert!(bits & NAN_BITS_MASK != SIGNALLING_NAN_BITS);
+                Value(bits)
+            }
+            Self::Bool(x) => unsafe { Value::from_raw_parts(ValueKind::Bool, x as u64) },
             Self::String(ptr) => pack_ptr!(ptr, String),
             Self::Path(ptr) => pack_ptr!(ptr, Path),
             Self::List(ptr) => pack_ptr!(ptr, List),
             Self::Attrset(ptr) => pack_ptr!(ptr, Attrset),
             Self::Function(ptr) => pack_ptr!(ptr, Function),
-            Self::Lazy(ptr) => Value(Rc::into_raw(ptr.0) as u64 | ATTRSET_TAG_LAZY),
+            Self::Lazy(ptr) => pack_ptr!(ptr.0, Lazy),
             Self::Null => Value::NULL,
         }
     }
@@ -366,6 +352,9 @@ impl UnpackedValue {
             Self::Integer(value) => {
                 write!(f, "{value}")
             }
+            Self::Double(value) => {
+                write!(f, "{value}")
+            }
             Self::Bool(value) => {
                 write!(f, "{value}")
             }
@@ -398,6 +387,9 @@ impl UnpackedValue {
     pub(crate) fn fmt_debug_rec(&self, depth: usize, f: &mut impl FmtWrite) -> std::fmt::Result {
         match self {
             Self::Integer(value) => {
+                write!(f, "{value}")
+            }
+            Self::Double(value) => {
                 write!(f, "{value}")
             }
             Self::Bool(value) => {
@@ -440,39 +432,140 @@ impl Debug for UnpackedValue {
     }
 }
 
-// https://github.com/SerenityOS/serenity/blob/1d29f9081fc243407e4902713d3c7fc0ee69650c/Userland/Libraries/LibJS/Runtime/Value.h
+// 1111111111110000000000000000000000000000000000000000000000000000
+// |--------------| x86_64 canonical address unused space (16 bits)
+// |----------| IEEE 764 double precision floating point required NaN bits (12 bits)
+// The four unused bits is where we will store our tag.
+// The tag 0b0000 is reserved for double since that is the preferred NaN representation.
+
+// Heap (pointer) types:
+// Attrset
+// Function
+// String
+// Path
+// List
+// Lazy
+//
+// Pointers have to be sign extended when extracted from the value. (see x86_64 canonical address form)
+//
+// Value types:
+// Double
+// Integer
+// Bool
+// Null
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) const QUIET_NAN_BITS: u64 =
+    0b0111111111110000000000000000000000000000000000000000000000000000;
+pub(crate) const SIGNALLING_NAN_BITS: u64 =
+    0b0111111111100000000000000000000000000000000000000000000000000000;
+pub(crate) const NAN_BITS_MASK: u64 = QUIET_NAN_BITS;
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("QUIET_NAN_BITS and SIGNALLING_NAN_BITS not defined for this architecture.");
+
+pub(crate) const VALUE_TAG_MASK: u64 =
+    0b1111111111111111000000000000000000000000000000000000000000000000;
+pub(crate) const VALUE_PAYLOAD_MASK: u64 = !VALUE_TAG_MASK;
+// A quiet NaN on *most* platforms.
+pub(crate) const CANONICAL_NAN_BITS: u64 =
+    0b0111111111110000000000000000000000000000000000000000000000000000;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    // NOTE: Quiet NaN
+    Double = 0b0000,
+    Attrset = 0b0001,
+    Function = 0b0010,
+    String = 0b0011,
+    Path = 0b0100,
+    List = 0b0101,
+    Integer = 0b0110,
+    Bool = 0b0111,
+    Lazy = 0b1000,
+    Null = 0b1001,
+}
+
+impl ValueKind {
+    #[inline(always)]
+    pub(crate) const fn as_nan_bits(self) -> u64 {
+        SIGNALLING_NAN_BITS | ((self as u64) << 48)
+    }
+
+    /// as_nan(self) >> 48
+    #[inline(always)]
+    pub(crate) const fn as_shifted(self) -> u16 {
+        (self.as_nan_bits() >> 48) as u16
+    }
+}
+
 #[repr(transparent)]
-pub struct Value(pub(crate) u64);
+pub struct Value(u64);
 
 impl Value {
-    pub const NULL: Value = Value(ATTRSET_TAG_NULL);
-    pub const TRUE: Value = Value(0b1000 | ValueKind::Bool as u64);
-    pub const FALSE: Value = Value(ValueKind::Bool as u64);
+    pub const NULL: Value = unsafe { Value::from_raw_parts(ValueKind::Null, 0) };
+    pub const TRUE: Value = unsafe { Value::from_raw_parts(ValueKind::Bool, 1) };
+    pub const FALSE: Value = unsafe { Value::from_raw_parts(ValueKind::Bool, 0) };
+
+    #[inline(always)]
+    pub(crate) const unsafe fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn into_raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    pub(crate) const fn as_raw(&self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    const unsafe fn from_raw_parts(kind: ValueKind, payload: u64) -> Self {
+        // I love not being able to assert in const fns...
+        // debug_assert_eq!(payload & !((1 << 49) - 1), 0);
+        Self::from_raw(payload | kind.as_nan_bits())
+    }
 
     pub(crate) const fn from_bool(value: bool) -> Value {
         if value {
-            return Value::TRUE;
+            Value::TRUE
         } else {
-            return Value::FALSE;
+            Value::FALSE
         }
     }
 
-    pub fn kind(&self) -> ValueKind {
-        match self.0 & ATTRSET_TAG_MASK {
-            ATTRSET_TAG_NULL => return ValueKind::Null,
-            ATTRSET_TAG_LAZY => return ValueKind::Lazy,
-            _ => (),
+    #[cfg(target_arch = "x86_64")]
+    fn as_pointer_bits(&self) -> u64 {
+        unsafe {
+            std::mem::transmute::<_, u64>((std::mem::transmute::<_, i64>(self.0 << 16)) >> 16)
         }
-        let value = self.0 & VALUE_TAG_MASK;
-        assert!(value <= ValueKind::Bool as u64);
-        unsafe { std::mem::transmute(value as u8) }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    compile_error!("Value::as_pointer_bits is not implemented for this architecture");
+
+    pub fn kind(&self) -> ValueKind {
+        if self.0 & NAN_BITS_MASK != SIGNALLING_NAN_BITS {
+            return ValueKind::Double;
+        }
+        let kind = (self.0 & (VALUE_TAG_MASK - NAN_BITS_MASK)) >> 48;
+        unsafe { std::mem::transmute(kind as u8) }
+    }
+
+    #[inline(always)]
+    pub fn is(&self, kind: ValueKind) -> bool {
+        self.0 & VALUE_TAG_MASK == kind.as_nan_bits()
     }
 
     pub fn unpack(&self) -> UnpackedValue {
         macro_rules! unpack_ptr {
             ($kind: ident) => {
                 UnpackedValue::$kind(unsafe {
-                    let raw = (self.0 & !VALUE_TAG_MASK) as *mut _;
+                    let raw = self.as_pointer_bits() as *mut _;
                     Rc::increment_strong_count(raw);
                     Rc::from_raw(raw)
                 })
@@ -480,10 +573,9 @@ impl Value {
         }
         match self.kind() {
             ValueKind::Integer => UnpackedValue::Integer(unsafe {
-                std::mem::transmute((self.0 >> VALUE_TAG_WIDTH) as u32)
+                std::mem::transmute((self.0 & VALUE_PAYLOAD_MASK) as u32)
             }),
-            ValueKind::Double => todo!(),
-            ValueKind::Bool => UnpackedValue::Bool(self.0 == 0b1000 | (ValueKind::Bool as u64)),
+            ValueKind::Double => UnpackedValue::Double(f64::from_bits(self.0)),
             ValueKind::String => unpack_ptr!(String),
             ValueKind::Path => unpack_ptr!(Path),
             ValueKind::List => unpack_ptr!(List),
@@ -491,12 +583,11 @@ impl Value {
             ValueKind::Function => unpack_ptr!(Function),
             // FIXME: this pointer may not be in x86_64 canonical form
             ValueKind::Lazy => unsafe {
-                UnpackedValue::Lazy(LazyValue({
-                    let raw = (self.0 & !ATTRSET_TAG_MASK) as *const _;
-                    Rc::increment_strong_count(raw);
-                    Rc::from_raw(raw)
-                }))
+                let raw = self.as_pointer_bits() as *mut _;
+                Rc::increment_strong_count(raw);
+                UnpackedValue::Lazy(LazyValue(Rc::from_raw(raw)))
             },
+            ValueKind::Bool => UnpackedValue::Bool(self.0 == Value::TRUE.0),
             ValueKind::Null => UnpackedValue::Null,
         }
     }
@@ -504,25 +595,22 @@ impl Value {
     pub(crate) fn into_unpacked(self) -> UnpackedValue {
         macro_rules! unpack_ptr {
             ($kind: ident) => {
-                UnpackedValue::$kind(unsafe { Rc::from_raw((self.0 & !VALUE_TAG_MASK) as *mut _) })
+                UnpackedValue::$kind(unsafe { Rc::from_raw(self.as_pointer_bits() as *mut _) })
             };
         }
         match self.kind() {
             ValueKind::Integer => UnpackedValue::Integer(unsafe {
-                std::mem::transmute((self.0 >> VALUE_TAG_WIDTH) as u32)
+                std::mem::transmute((self.0 & VALUE_PAYLOAD_MASK) as u32)
             }),
-            ValueKind::Double => todo!(),
-            ValueKind::Bool => UnpackedValue::Bool(self.0 == 0b1000 | (ValueKind::Bool as u64)),
+            ValueKind::Double => UnpackedValue::Double(f64::from_bits(self.0)),
+            ValueKind::Bool => UnpackedValue::Bool(self.0 == Value::TRUE.0),
             ValueKind::String => unpack_ptr!(String),
             ValueKind::Path => unpack_ptr!(Path),
             ValueKind::List => unpack_ptr!(List),
             ValueKind::Attrset => unpack_ptr!(Attrset),
             ValueKind::Function => unpack_ptr!(Function),
-            // FIXME: this pointer may not be in x86_64 canonical form
             ValueKind::Lazy => unsafe {
-                UnpackedValue::Lazy(LazyValue(Rc::from_raw(
-                    (self.0 & !ATTRSET_TAG_MASK) as *const _,
-                )))
+                UnpackedValue::Lazy(LazyValue(Rc::from_raw(self.as_pointer_bits() as *const _)))
             },
             ValueKind::Null => UnpackedValue::Null,
         }
@@ -536,6 +624,7 @@ impl Value {
         }
         match &self.unpack() {
             UnpackedValue::Integer(_) => (),
+            UnpackedValue::Double(_) => (),
             UnpackedValue::Bool(_) => (),
             UnpackedValue::List(x) => incref!(x),
             UnpackedValue::Attrset(x) => incref!(x),
@@ -548,17 +637,17 @@ impl Value {
     }
 
     pub(crate) fn evaluate(&self) -> &Value {
-        if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
-            unsafe { (*((self.0 & !ATTRSET_TAG_MASK) as *mut LazyValueImpl)).evaluate() }
+        if self.is(ValueKind::Lazy) {
+            unsafe { (*(self.as_pointer_bits() as *mut LazyValueImpl)).evaluate() }
         } else {
             self
         }
     }
 
     pub(crate) fn evaluate_mut(&mut self) -> &Value {
-        if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
+        if self.is(ValueKind::Lazy) {
             unsafe {
-                LazyValue(Rc::from_raw((self.0 & !ATTRSET_TAG_MASK) as *mut _))
+                LazyValue(Rc::from_raw(self.as_pointer_bits() as *mut _))
                     .evaluate()
                     .clone_into(self)
             }
@@ -567,9 +656,9 @@ impl Value {
     }
 
     pub(crate) fn into_evaluated(self) -> Value {
-        if (self.0 & ATTRSET_TAG_MASK) == ATTRSET_TAG_LAZY {
+        if self.is(ValueKind::Lazy) {
             unsafe {
-                (*((self.0 & !ATTRSET_TAG_MASK) as *mut LazyValueImpl))
+                (*(self.as_pointer_bits() as *mut LazyValueImpl))
                     .evaluate()
                     .clone()
             }
@@ -582,25 +671,12 @@ impl Value {
         UnpackedValue::Lazy(LazyValue::from_closure(|| fun(self))).pack()
     }
 
-    #[inline]
-    pub(crate) unsafe fn leaking_copy(&self) -> Value {
-        Value(self.0)
-    }
-
     pub fn is_true(&self) -> bool {
         self.0 == Self::TRUE.0
     }
 
     pub fn is_false(&self) -> bool {
         self.0 == Self::FALSE.0
-    }
-
-    pub fn equal(self, other: Value) -> Value {
-        (self == other).into()
-    }
-
-    pub fn not_equal(self, other: Value) -> Value {
-        (self != other).into()
     }
 }
 
@@ -612,6 +688,21 @@ impl PartialEq for Value {
                 UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
             ) => self.0 == other.0,
             (UnpackedValue::String(a), UnpackedValue::String(b)) => a == b,
+            (UnpackedValue::Attrset(a), UnpackedValue::Attrset(b)) => {
+                let (a, b) = unsafe { (&*a.get(), &*b.get()) };
+                if a.len() != b.len() {
+                    return false;
+                }
+                for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
+                    if ka != kb {
+                        return false;
+                    }
+                    if va.evaluate() != vb.evaluate() {
+                        return false;
+                    }
+                }
+                true
+            }
             (a, b) if a.kind() != b.kind() => false,
             (a, b) => throw!(
                 "== is not supported between values of type {} and {}",
@@ -619,6 +710,16 @@ impl PartialEq for Value {
                 b.kind()
             ),
         }
+    }
+}
+
+impl Value {
+    pub(crate) extern "C-unwind" fn equal(self, other: Value) -> Value {
+        (self == other).into()
+    }
+
+    pub(crate) extern "C-unwind" fn not_equal(self, other: Value) -> Value {
+        (self != other).into()
     }
 }
 
@@ -659,9 +760,11 @@ macro_rules! value_impl_binary_operators {
 }
 
 impl Value {
+    // TODO: support mixing Integer and Double operands
     value_impl_binary_operators! {
         +add(a, b) {
             Integer => a + b,
+            Double => a + b,
             String => {
                     let mut result = String::with_capacity(a.len() + b.len());
                     result += &a;
@@ -669,9 +772,9 @@ impl Value {
                     result
             }
         };
-        -sub(a, b) { Integer => a - b };
-        *mul(a, b) { Integer => a * b };
-        /div(a, b) { Integer => a / b };
+        -sub(a, b) { Integer => a - b, Double => a - b };
+        *mul(a, b) { Integer => a * b, Double => a * b };
+        /div(a, b) { Integer => a / b, Double => a / b };
         <less(a, b) { Integer => a < b, String => a < b };
         <=less_or_equal(a, b) { Integer => a <= b, String => a <= b };
         >=greater_or_equal(a, b) { Integer => a >= b, String => a >= b };

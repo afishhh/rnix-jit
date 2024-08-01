@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     dwarf::*, exception::*, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan,
-    Value, ValueKind, ATTRSET_TAG_LAZY, ATTRSET_TAG_MASK, VALUE_TAG_MASK, VALUE_TAG_WIDTH,
+    Value, ValueKind,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -64,7 +64,9 @@ impl ExecutableInternable for String {
 impl ExecutableInternable for Value {
     type Output = Value;
     fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
-        closure._values.push(unsafe { self.leaking_copy() });
+        closure
+            ._values
+            .push(unsafe { Value::from_raw(self.as_raw()) });
         self
     }
 }
@@ -101,7 +103,7 @@ impl Executable {
     pub fn run(&self, scope: *mut Scope, arg: &Value) -> Value {
         unsafe {
             asm!("mov r10, {}", in(reg) scope, out("r10") _);
-            (self.code)(Value::NULL, arg.leaking_copy())
+            (self.code)(Value::NULL, Value::from_raw(arg.as_raw()))
         }
     }
 
@@ -268,6 +270,46 @@ impl Compiler {
                 };
             }
 
+            macro_rules! unpack {
+                (Attrset $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@pointer Attrset; $reg; $tmp; $else);
+                };
+                (List $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@pointer List; $reg; $tmp; $else);
+                };
+                (String $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@pointer String; $reg; $tmp; $else);
+                };
+                (Function $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@pointer Function; $reg; $tmp; $else);
+                };
+                (Lazy $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@pointer Lazy; $reg; $tmp; $else);
+                };
+                (Integer $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@check Integer; $reg; $tmp; $else);
+                };
+                (Bool $reg: ident, tmp = $tmp: ident, else => $else: ident) => {
+                    unpack!(@check Bool; $reg; $tmp; $else);
+                };
+                (@pointer $kind: ident; $reg: ident; $tmp: ident; $else: ident) => {{
+                    asm.mov($tmp, $reg)?;
+                    asm.shr($tmp, 48)?;
+                    asm.cmp($tmp, ValueKind::$kind.as_shifted() as i32)?;
+                    asm.jne($else)?;
+                    // FIXME: Does this actually sign extend?
+                    asm.shl($reg, 16)?;
+                    asm.shr($reg, 16)?;
+                }};
+                (@check $kind: ident; $reg: ident; $tmp: ident; $else: ident) => {{
+                    asm.mov($tmp, $reg)?;
+                    asm.shr($tmp, 48)?;
+                    asm.cmp($tmp, ValueKind::$kind.as_shifted() as i32)?;
+                    asm.jne($else)?;
+                }};
+            }
+
+
             if let Some(ref parameter) = closure.parameter {
                 let param = &**parameter as *const CompiledParameter;
                 // rdi = Current function Value (if a function)
@@ -278,14 +320,12 @@ impl Compiler {
 
                 // SANITY CHECK: Make sure rdi is a function
                 asm.mov(rax, rdi)?;
-                asm.and(rax, VALUE_TAG_MASK as i32)?;
-                asm.cmp(al, ValueKind::Function as i32)?;
-                asm.jne(not_a_function)?;
+                unpack!(Function rax, tmp = rcx, else => not_a_function);
 
                 asm.mov(
                     rdi,
                     qword_ptr(
-                        rdi + offset_of!(Function, parent_scope) - ValueKind::Function as i32,
+                        rax + offset_of!(Function, parent_scope),
                     ),
                 )?;
                 asm.mov(rdx, param as u64)?;
@@ -305,32 +345,19 @@ impl Compiler {
                 asm.mov(r15, r10)?;
             }
 
-            // These values are always kept here
-            asm.mov(r13, ATTRSET_TAG_LAZY)?;
-            asm.mov(r14, ATTRSET_TAG_MASK)?;
-
             for operation in program.operations {
                 macro_rules! unlazy {
-                ($reg: ident, rdi) => {
+                ($reg: ident, tmp = $tmp: ident) => {
                     let mut _unlazy = asm.create_label();
-                    asm.mov(rdi, $reg)?;
-                    asm.and(rdi, r14)?;
-                    asm.cmp(rdi, r13)?;
-                    asm.jne(_unlazy)?;
-                    asm.mov(rdi, $reg)?;
+                    unpack!(Lazy $reg, tmp = $tmp, else => _unlazy);
+                    unlazy!(@mov_rdi_if_required $reg);
                     call!(rust value_into_evaluated);
                     asm.mov($reg, rax)?;
                     asm.set_label(&mut _unlazy)?;
                 };
-                (rdi, $scratch: ident) => {
-                    let mut _unlazy = asm.create_label();
-                    asm.mov($scratch, rdi)?;
-                    asm.and($scratch, r14)?;
-                    asm.cmp($scratch, r13)?;
-                    asm.jne(_unlazy)?;
-                    call!(rust value_into_evaluated);
-                    asm.mov(rdi, rax)?;
-                    asm.set_label(&mut _unlazy)?;
+                (@mov_rdi_if_required rdi) => {};
+                (@mov_rdi_if_required $src: ident) => {
+                    asm.mov(rdi, $src)?;
                 };
             }
 
@@ -338,33 +365,31 @@ impl Compiler {
                 (int => $(retag($tag: ident))? $if_int: block, fallback = $other: expr) => {{
                     asm.pop(r12)?;
                     stack_values -= 1;
-                    unlazy!(r12, rdi);
+                    unlazy!(r12, tmp = rdi);
                     asm.pop(rdi)?;
                     stack_values -= 1;
-                    unlazy!(rdi, rcx);
+                    unlazy!(rdi, tmp = rcx);
                     asm.mov(rsi, r12)?;
 
                     let mut end = asm.create_label();
 
                     asm.mov(rcx, rdi)?;
-                    asm.and(rcx, VALUE_TAG_MASK as i32)?;
+                    asm.shr(rcx, 48)?;
                     asm.mov(rdx, rsi)?;
-                    asm.and(rdx, VALUE_TAG_MASK as i32)?;
+                    asm.shr(rdx, 48)?;
 
                     let mut not_an_integer = asm.create_label();
 
-                    asm.cmp(cl, ValueKind::Integer as i32)?;
+                    asm.cmp(ecx, ValueKind::Integer.as_shifted() as i32)?;
                     asm.jnz(not_an_integer)?;
 
-                    asm.cmp(dl, ValueKind::Integer as i32)?;
+                    asm.cmp(edx, ValueKind::Integer.as_shifted() as i32)?;
                     asm.jnz(not_an_integer)?;
 
-                    asm.shr(rdi, VALUE_TAG_WIDTH as i32)?;
-                    asm.shr(rsi, VALUE_TAG_WIDTH as i32)?;
                     let register = $if_int;
                     $(
-                        asm.shl(register, VALUE_TAG_WIDTH as i32)?;
-                        asm.or(register, ValueKind::$tag as i32)?;
+                        asm.mov(r10, ValueKind::$tag.as_nan_bits())?;
+                        asm.or(register, r10)?;
                     )?
 
                     asm.push(register)?;
@@ -383,8 +408,8 @@ impl Compiler {
                 (comparison $cmov: ident or $fallback: expr) => {{
                     impl_binary_operator!(
                         int => {
-                            asm.mov(rax, Value::FALSE.0)?;
-                            asm.mov(rbx, Value::TRUE.0)?;
+                            asm.mov(rax, Value::FALSE.as_raw())?;
+                            asm.mov(rbx, Value::TRUE.as_raw())?;
                             asm.cmp(rdi, rsi)?;
                             asm.$cmov(rax, rbx)?;
                             rax
@@ -398,34 +423,36 @@ impl Compiler {
                     pop rdi;
                     {
                         stack_values -= 1;
-                        unlazy!(rdi, rcx);
+                        unlazy!(rdi, tmp = rcx);
                     }
-                    cmp rdi, Value::from_bool(!$value).0 as i32;
+                    mov r12, Value::from_bool(!$value).into_raw();
+                    cmp rdi, r12;
                     jne shortcircuit_possible;
 
                     mov r10, r15;
                     { call!(rust unsafe { (*second).code }); }
                     mov rcx, rax;
-                    and rcx, VALUE_TAG_MASK as i32;
-                    cmp rcx, ValueKind::Bool as i32;
+                    shr rcx, 48;
+                    cmp rcx, ValueKind::Bool.as_shifted() as i32;
                     jne second_not_boolean;
 
                     push $nresult;
                     jmp end;
 
                 shortcircuit_possible:
-                    cmp rdi, Value::from_bool($value).0 as i32;
+                    xor r12, 1;
+                    cmp rdi, r12;
                     jne first_not_boolean;
                     { let register = $sresult; }
                     push register;
                     jmp end;
 
                 first_not_boolean:
-                    mov rdi, c"first operand to && operator is not a boolean".as_ptr() as u64;
+                    mov rdi, c"first operand of boolean operator is not a boolean".as_ptr() as u64;
                     { call!(rust asm_throw); }
 
                 second_not_boolean:
-                    mov rdi, c"second operand to && operator is not a boolean".as_ptr() as u64;
+                    mov rdi, c"second operand of boolean operator is not a boolean".as_ptr() as u64;
                     { call!(rust asm_throw); }
 
                 end:
@@ -433,19 +460,9 @@ impl Compiler {
                 })};
             }
 
-                macro_rules! unpack {
-                    (Attrset $reg: ident tmp = $tmp: ident else => $else: ident) => {{
-                        asm.mov($tmp, $reg)?;
-                        asm.and($tmp, r14)?;
-                        asm.cmp($tmp, ValueKind::Attrset as i32)?;
-                        asm.jne($else)?;
-                        asm.sub($reg, ValueKind::Attrset as i32)?;
-                    }};
-                }
-
                 match operation {
                     Operation::Push(value) => {
-                        asm.mov(rdi, closure.intern(value).0)?;
+                        asm.mov(rdi, closure.intern(value).into_raw())?;
                         call!(rust value_ref);
                         asm.push(rax)?;
                         stack_values += 1;
@@ -492,7 +509,7 @@ impl Compiler {
                     Operation::Implication(second) => impl_binary_operator!(
                         boolean second,
                         shortcircuit(rdi = false) => {
-                            asm.mov(rdi, Value::TRUE.0)?;
+                            asm.mov(rdi, Value::TRUE.as_raw())?;
                             rdi
                         },
                         else(rax) => rax
@@ -522,7 +539,8 @@ impl Compiler {
 
                         if rec {
                             asm.mov(rdi, rax)?;
-                            asm.sub(rdi, ValueKind::Attrset as i32)?;
+                            asm.shl(rdi, 16)?;
+                            asm.shr(rdi, 16)?;
                             asm.mov(rsi, r15)?;
                             call!(rust scope_create_rec);
                             asm.mov(r15, rax)?;
@@ -536,12 +554,7 @@ impl Compiler {
 
                         let mut not_an_attrset = asm.create_label();
                         for _ in 0..(components - 1) {
-                            asm.mov(rbx, rdi)?;
-                            asm.and(rbx, r14)?;
-                            asm.cmp(rbx, ValueKind::Attrset as i32)?;
-                            asm.jne(not_an_attrset)?;
-
-                            asm.sub(rdi, ValueKind::Attrset as i32)?;
+                            unpack!(Attrset rdi, tmp = rbx, else => not_an_attrset);
 
                             asm.pop(rsi)?;
                             stack_values -= 1;
@@ -558,12 +571,8 @@ impl Compiler {
                             asm.mov(rdi, rax)?;
                         }
 
-                        asm.mov(rbx, rdi)?;
-                        asm.and(rbx, r14)?;
-                        asm.cmp(rbx, ValueKind::Attrset as i32)?;
-                        asm.jne(not_an_attrset)?;
+                        unpack!(Attrset rdi, tmp = rbx, else => not_an_attrset);
 
-                        asm.sub(rdi, ValueKind::Attrset as i32)?;
                         asm.mov(rsi, r15)?;
                         asm.mov(rdx, raw as u64)?;
                         asm.pop(rcx)?;
@@ -588,11 +597,7 @@ impl Compiler {
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
 
-                        asm.mov(rbx, rdi)?;
-                        asm.and(rbx, r14)?;
-                        asm.cmp(rbx, ValueKind::Attrset as i32)?;
-                        asm.jne(not_an_attrset)?;
-                        asm.sub(rdi, ValueKind::Attrset as i32)?;
+                        unpack!(Attrset rdi, tmp = rbx, else => not_an_attrset);
 
                         let mut end = asm.create_label();
                         if let Some(program) = source {
@@ -631,7 +636,7 @@ impl Compiler {
 
                         for i in 0..=components {
                             asm.mov(rdi, qword_ptr(rsp + 8 * i))?;
-                            unlazy!(rdi, rcx);
+                            unlazy!(rdi, tmp = rcx);
                             asm.mov(qword_ptr(rsp + 8 * i), rdi)?;
                         }
 
@@ -649,24 +654,16 @@ impl Compiler {
                     Operation::HasAttrpath(len) => {
                         assert!(stack_values > len);
                         asm.mov(r12, qword_ptr(rsp + 8 * len))?;
-                        unlazy!(r12, rdi);
+                        unlazy!(r12, tmp = rdi);
 
                         let mut not_an_attrset = asm.create_label();
                         let mut not_a_string = asm.create_label();
-                        asm.mov(rcx, r12)?;
-                        asm.and(rcx, r14)?;
-                        asm.cmp(rcx, ValueKind::Attrset as i32)?;
-                        asm.jne(not_an_attrset)?;
-                        asm.sub(r12, ValueKind::Attrset as i32)?;
+                        unpack!(Attrset r12, tmp = rcx, else => not_an_attrset);
 
                         for i in 0..len {
                             asm.mov(rdi, qword_ptr(rsp + 8 * i))?;
-                            unlazy!(rdi, rax);
-                            asm.mov(rcx, rdi)?;
-                            asm.and(rcx, VALUE_TAG_MASK as i32)?;
-                            asm.cmp(rcx, ValueKind::String as i32)?;
-                            asm.jne(not_a_string)?;
-                            asm.sub(rdi, ValueKind::String as i32)?;
+                            unlazy!(rdi, tmp = rax);
+                            unpack!(String rdi, tmp = rcx, else => not_a_string);
                             asm.mov(qword_ptr(rsp + 8 * i), rdi)?;
                         }
 
@@ -699,7 +696,7 @@ impl Compiler {
                         assert!(stack_values >= 2);
                         asm.pop(rbx)?;
                         stack_values -= 1;
-                        unlazy!(rbx, rdi);
+                        unlazy!(rbx, tmp = rdi);
                         asm.pop(rsi)?;
                         stack_values -= 1;
 
@@ -707,17 +704,12 @@ impl Compiler {
 
                         let mut not_a_function = asm.create_label();
 
-                        asm.mov(rcx, rbx)?;
-                        asm.and(rcx, VALUE_TAG_MASK as i32)?;
-                        asm.cmp(cl, ValueKind::Function as u32)?;
-                        asm.jne(not_a_function)?;
-
                         asm.mov(rdi, rbx)?;
+                        unpack!(Function rbx, tmp = rcx, else => not_a_function);
                         asm.mov(
                             rax,
                             qword_ptr(
                                 rbx + offset_of!(Function, call) as i32
-                                    - ValueKind::Function as i32,
                             ),
                         )?;
                         call!(reg rax);
@@ -727,7 +719,7 @@ impl Compiler {
                         asm.set_label(&mut not_a_function)?;
 
                         asm.mov(rdi, c"apply called on non-function value".as_ptr() as u64)?;
-                        call!(rust asm_panic);
+                        call!(rust asm_throw);
 
                         asm.set_label(&mut end)?;
                         stack_values += 1;
@@ -755,12 +747,7 @@ impl Compiler {
                         let mut end = asm.create_label();
                         let mut not_a_list = asm.create_label();
 
-                        asm.mov(rax, rdi)?;
-                        asm.and(rax, VALUE_TAG_MASK as i32)?;
-                        asm.cmp(al, ValueKind::List as u32)?;
-                        asm.jne(not_a_list)?;
-
-                        asm.sub(rdi, ValueKind::List as i32)?;
+                        unpack!(List rdi, tmp = rax, else => not_a_list);
                         asm.mov(rsi, r15)?;
                         asm.mov(rdx, raw as u64)?;
                         call!(rust list_append_value);
@@ -817,20 +804,17 @@ impl Compiler {
                         asm.pop(rsi)?;
                         stack_values -= 1;
 
-                        unlazy!(rsi, rdi);
+                        unlazy!(rsi, tmp = rdi);
 
                         let mut end = asm.create_label();
                         let mut not_a_boolean = asm.create_label();
-                        asm.mov(rdx, rsi)?;
-                        asm.and(rdx, VALUE_TAG_MASK as i32)?;
-                        asm.cmp(dl, ValueKind::Bool as i32)?;
-                        asm.jne(not_a_boolean)?;
+                        unpack!(Bool rsi, tmp = rdx, else => not_a_boolean);
 
                         unsafe {
                             asm.mov(rax, (*if_false).code() as u64)?;
                             asm.mov(rbx, (*if_true).code() as u64)?;
                         }
-                        asm.cmp(rsi, ValueKind::Bool as i32)?;
+                        asm.cmp(esi, 0)?;
                         asm.cmovne(rax, rbx)?;
 
                         asm.mov(r10, r15)?;
@@ -852,20 +836,15 @@ impl Compiler {
                         assert!(stack_values >= 1);
                         asm.pop(rdi)?;
                         stack_values -= 1;
-                        unlazy!(rdi, rcx);
+                        unlazy!(rdi, tmp = rcx);
 
                         let mut end = asm.create_label();
                         let mut not_an_integer = asm.create_label();
 
-                        asm.mov(rax, rdi)?;
-                        asm.and(rax, VALUE_TAG_MASK as i32)?;
-                        asm.cmp(rax, ValueKind::Integer as i32)?;
-                        asm.jne(not_an_integer)?;
-
-                        asm.shr(rdi, 3)?;
+                        unpack!(Integer rdi, tmp = rax, else => not_an_integer);
                         asm.neg(edi)?;
-                        asm.shl(rdi, 3)?;
-                        asm.or(rdi, ValueKind::Integer as i32)?;
+                        asm.mov(r10, ValueKind::Integer.as_nan_bits())?;
+                        asm.or(rdi, r10)?;
 
                         asm.push(rdi)?;
                         asm.jmp(end)?;
@@ -875,7 +854,7 @@ impl Compiler {
                             rdi,
                             c"negate attempted on non-integer value".as_ptr() as u64,
                         )?;
-                        call!(rust asm_panic);
+                        call!(rust asm_throw);
 
                         asm.set_label(&mut end)?;
                         stack_values += 1;
@@ -889,25 +868,20 @@ impl Compiler {
                         let mut not_an_integer = asm.create_label();
                         let mut not_a_boolean = asm.create_label();
 
-                        asm.mov(rax, rdi)?;
-                        asm.and(rax, VALUE_TAG_MASK as i32)?;
-                        asm.cmp(rax, ValueKind::Integer as i32)?;
-                        asm.jne(not_an_integer)?;
+                        unpack!(Integer rdi, tmp = rax, else => not_an_integer);
+                        asm.not(rdi)?;
+                        asm.mov(r10, ValueKind::Integer.as_nan_bits())?;
+                        asm.or(rdi, r10)?;
 
-                        asm.shr(rax, 3)?;
-                        asm.not(rax)?;
-                        asm.shl(rax, 3)?;
-                        asm.or(rax, ValueKind::Integer as i32)?;
-
-                        asm.push(rax)?;
+                        asm.push(rdi)?;
                         asm.jmp(end)?;
 
                         asm.set_label(&mut not_an_integer)?;
 
-                        asm.cmp(rax, ValueKind::Bool as i32)?;
+                        asm.cmp(rax, ValueKind::Bool.as_shifted() as i32)?;
                         asm.jne(not_a_boolean)?;
 
-                        asm.xor(rdi, 0b1000)?;
+                        asm.xor(rdi, 0b1)?;
                         asm.push(rdi)?;
                         asm.jmp(end)?;
 
@@ -936,16 +910,16 @@ impl Compiler {
                         assert!(stack_values >= 2);
                         asm.pop(r12)?;
                         stack_values -= 1;
-                        unlazy!(r12, rdi);
+                        unlazy!(r12, tmp = rdi);
                         asm.pop(rdi)?;
                         stack_values -= 1;
-                        unlazy!(rdi, rcx);
+                        unlazy!(rdi, tmp = rcx);
                         asm.mov(rsi, r12)?;
 
                         let mut end = asm.create_label();
                         let mut not_an_attrset = asm.create_label();
-                        unpack!(Attrset rdi tmp = rcx else => not_an_attrset);
-                        unpack!(Attrset rsi tmp = rcx else => not_an_attrset);
+                        unpack!(Attrset rdi, tmp = rcx, else => not_an_attrset);
+                        unpack!(Attrset rsi, tmp = rcx, else => not_an_attrset);
                         call!(rust attrset_update);
                         asm.push(rax)?;
 
@@ -965,19 +939,15 @@ impl Compiler {
                         assert!(stack_values >= 2);
                         asm.pop(rdi)?;
                         stack_values -= 1;
-                        unlazy!(rdi, rcx);
+                        unlazy!(rdi, tmp = rcx);
 
                         let mut end = asm.create_label();
                         let mut not_a_string = asm.create_label();
 
-                        asm.mov(rcx, rdi)?;
-                        asm.and(rcx, VALUE_TAG_MASK as i32)?;
-                        asm.cmp(rcx, ValueKind::String as i32)?;
-                        asm.jne(not_a_string)?;
-
-                        asm.sub(rdi, ValueKind::String as i32)?;
+                        unpack!(String rdi, tmp = rcx, else => not_a_string);
                         asm.mov(rsi, qword_ptr(rsp))?;
-                        asm.sub(rsi, ValueKind::String as i32)?;
+                        asm.shl(rsi, 16)?;
+                        asm.shr(rsi, 16)?;
 
                         call!(rust string_mut_append);
                         asm.jmp(end)?;

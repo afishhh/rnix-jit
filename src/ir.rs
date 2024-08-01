@@ -225,7 +225,9 @@ impl IRCompiler {
             Expr::Str(x) => self.build_string(x.normalized_parts(), |x| x, false, program),
             Expr::Path(x) => self.build_string(x.parts(), |x| x.syntax().text(), true, program),
             Expr::Literal(x) => match x.kind() {
-                rnix::ast::LiteralKind::Float(_) => todo!(),
+                rnix::ast::LiteralKind::Float(x) => program.operations.push(Operation::Push(
+                    UnpackedValue::Double(x.value().unwrap()).pack(),
+                )),
                 rnix::ast::LiteralKind::Integer(x) => {
                     program.operations.push(Operation::Push(
                         UnpackedValue::Integer(x.value().unwrap() as i32).pack(),

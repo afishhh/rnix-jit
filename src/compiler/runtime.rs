@@ -3,8 +3,8 @@ use std::{
 };
 
 use crate::{
-    throw, Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value, ValueList,
-    ValueMap,
+    throw, value::LazyValueImpl, Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value,
+    ValueList, ValueMap,
 };
 
 use super::{CompiledParameter, Executable};
@@ -321,8 +321,8 @@ pub unsafe extern "C" fn string_mut_append(from: NonNull<String>, to: &mut Strin
     Rc::decrement_strong_count(from.as_ptr());
 }
 
-pub unsafe extern "C-unwind" fn value_into_evaluated(a: Value) -> Value {
-    a.into_evaluated()
+pub unsafe extern "C-unwind" fn value_into_evaluated(a: *mut UnsafeCell<LazyValueImpl>) -> Value {
+    LazyValue(Rc::from_raw(a)).evaluate().clone()
 }
 
 pub unsafe extern "C" fn value_ref(a: ManuallyDrop<Value>) -> Value {
@@ -365,7 +365,7 @@ pub unsafe extern "C-unwind" fn asm_panic_with_value(msg: *const i8, value: Valu
     println!("[JITPANIC] {}", CStr::from_ptr(msg).to_string_lossy());
     println!(
         "[JITPANIC] Value passed to asm_panic_with_value: {} {value:?}",
-        value.0
+        value.as_raw()
     );
     panic!("jitpanic")
 }
