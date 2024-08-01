@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use regex::Regex;
 
+use crate::perfstats::measure_parsing_time;
 use crate::{
     compiler::COMPILER, throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind,
     ValueMap,
@@ -798,7 +799,10 @@ pub fn import(path: PathBuf) -> Value {
     }
     .unwrap();
 
-    let result = rnix::Root::parse(&expr);
+    let result = {
+        let _tc = measure_parsing_time();
+        rnix::Root::parse(&expr)
+    };
     let program = IRCompiler::compile(
         path.parent().unwrap().to_path_buf(),
         path.to_string_lossy().to_string(),

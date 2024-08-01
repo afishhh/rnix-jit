@@ -127,7 +127,7 @@ pub unsafe extern "C-unwind" fn map_inherit_from(
                 };
                 (*attrs.get())
                     .get(key)
-                    .unwrap_or_else(|| panic!("inherit({:?}) {:?} missing", (*attrs.get()), key))
+                    .unwrap_or_else(|| throw!("inherit({:?}) {:?} missing", (*attrs.get()), key))
                     .clone()
             }))
             .pack(),

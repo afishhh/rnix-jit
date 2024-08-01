@@ -7,8 +7,7 @@ use std::{
 };
 
 use crate::{
-    dwarf::*, exception::*, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan,
-    Value, ValueKind,
+    dwarf::*, exception::*, perfstats::measure_jit_codegen_time, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan, Value, ValueKind
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -201,6 +200,7 @@ impl Compiler {
         program: Program,
         param: Option<Parameter>,
     ) -> Result<Rc<Executable>, IcedError> {
+        let _tc = measure_jit_codegen_time();
         // let debug_header = format!("{program:?}");
 
         let mut closure = ExecutableClosure::new(param.map(|param| {

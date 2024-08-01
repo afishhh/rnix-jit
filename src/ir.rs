@@ -6,7 +6,7 @@ use rnix::{
 };
 use rowan::ast::AstNode;
 
-use crate::{UnpackedValue, Value}; // NOTE: Importing this from rowan works but not from rnix...
+use crate::{perfstats::measure_ir_generation_time, UnpackedValue, Value}; // NOTE: Importing this from rowan works but not from rnix...
 
 #[derive(Debug)]
 pub struct SourceFile {
@@ -376,6 +376,7 @@ impl IRCompiler {
         file_content: String,
         expression: Expr,
     ) -> Program {
+        let _tc = measure_ir_generation_time();
         IRCompiler {
             working_directory,
             source_file: Rc::new(SourceFile {

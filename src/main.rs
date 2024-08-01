@@ -24,8 +24,10 @@ use dwarf::*;
 
 mod compiler;
 mod ir;
+mod perfstats;
 mod value;
 use ir::*;
+use perfstats::{measure_parsing_time, measure_total_evaluation_time};
 use value::*;
 
 enum ScopeStorage {
@@ -195,7 +197,10 @@ fn pretty_print_exception(exception: NixException) {
 }
 
 fn eval(root: PathBuf, filename: String, code: String) -> Result<Value, NixException> {
-    let parse = rnix::Root::parse(&code);
+    let parse = {
+        let _tc = measure_parsing_time();
+        rnix::Root::parse(&code)
+    };
     if !parse.errors().is_empty() {
         let mut msg = "parse errors encountered:\n".to_string();
         for (i, error) in parse.errors().iter().enumerate() {
@@ -240,6 +245,7 @@ fn main() -> ExitCode {
         },
         Command::Eval(EvalCommand { file, expr }) => {
             match catch_nix_unwind(move || {
+                let _tc = measure_total_evaluation_time();
                 let value = if let Some(file) = file {
                     import(file)
                 } else if let Some(expr) = expr {
@@ -259,10 +265,12 @@ fn main() -> ExitCode {
             {
                 Ok(value) => {
                     println!("{value:?}");
+                    perfstats::print_stats();
                     ExitCode::SUCCESS
                 }
                 Err(exception) => {
                     pretty_print_exception(exception);
+                    perfstats::print_stats();
                     ExitCode::FAILURE
                 }
             }
