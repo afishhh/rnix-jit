@@ -682,23 +682,22 @@ impl Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        match (self.unpack(), other.unpack()) {
+        match (self.evaluate().unpack(), other.evaluate().unpack()) {
             (
                 UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
                 UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
             ) => self.0 == other.0,
             (UnpackedValue::String(a), UnpackedValue::String(b)) => a == b,
             (UnpackedValue::Double(a), UnpackedValue::Double(b)) => a == b,
+            (UnpackedValue::Double(a), UnpackedValue::Integer(b)) => a == b.into(),
+            (UnpackedValue::Integer(a), UnpackedValue::Double(b)) => f64::from(a) == b,
             (UnpackedValue::Attrset(a), UnpackedValue::Attrset(b)) => unsafe {
                 *a.get() == *b.get()
             },
             (UnpackedValue::List(a), UnpackedValue::List(b)) => unsafe { *a.get() == *b.get() },
+            (UnpackedValue::Function(_), UnpackedValue::Function(_)) => false,
             (a, b) if a.kind() != b.kind() => false,
-            (a, b) => throw!(
-                "== is not supported between values of type {} and {}",
-                a.kind(),
-                b.kind()
-            ),
+            (_, _) => unreachable!(),
         }
     }
 }
@@ -860,7 +859,13 @@ fn test_value_macro() {
             let mut result = ValueMap::new();
             result.insert("hello".to_string(), 10.into());
             result.insert("computed key".to_string(), value!([124, "1245"]));
-            result.insert(9.to_string(), value!({ even = false; odd = true; }));
+            result.insert(
+                9.to_string(),
+                value!({
+                    even = false;
+                    odd = true;
+                }),
+            );
             result
         })
         .pack()
