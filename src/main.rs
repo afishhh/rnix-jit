@@ -129,7 +129,7 @@ enum Command {
 struct EvalCommand {
     #[clap(short, long)]
     file: Option<PathBuf>,
-    #[clap(short, long)]
+    #[clap(long)]
     expr: Option<String>,
 }
 
