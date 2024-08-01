@@ -688,6 +688,7 @@ impl PartialEq for Value {
                 UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
             ) => self.0 == other.0,
             (UnpackedValue::String(a), UnpackedValue::String(b)) => a == b,
+            (UnpackedValue::Path(a), UnpackedValue::Path(b)) => a == b,
             (UnpackedValue::Double(a), UnpackedValue::Double(b)) => a == b,
             (UnpackedValue::Double(a), UnpackedValue::Integer(b)) => a == b.into(),
             (UnpackedValue::Integer(a), UnpackedValue::Double(b)) => f64::from(a) == b,
