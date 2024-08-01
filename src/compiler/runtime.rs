@@ -235,7 +235,7 @@ pub unsafe extern "C-unwind" fn attrset_get_or_insert_attrset(
 }
 
 unsafe fn attrset_hasattrpath_impl(map: &ValueMap, names: &[&String]) -> Value {
-    let (current, rest) = names.split_last().unwrap();
+    let (current, rest) = names.split_first().unwrap();
     match (
         map.get(*current).map(Value::evaluate).map(Value::unpack),
         rest,
