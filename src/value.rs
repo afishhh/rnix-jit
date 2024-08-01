@@ -688,21 +688,11 @@ impl PartialEq for Value {
                 UnpackedValue::Integer(_) | UnpackedValue::Bool(_) | UnpackedValue::Null,
             ) => self.0 == other.0,
             (UnpackedValue::String(a), UnpackedValue::String(b)) => a == b,
-            (UnpackedValue::Attrset(a), UnpackedValue::Attrset(b)) => {
-                let (a, b) = unsafe { (&*a.get(), &*b.get()) };
-                if a.len() != b.len() {
-                    return false;
-                }
-                for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
-                    if ka != kb {
-                        return false;
-                    }
-                    if va.evaluate() != vb.evaluate() {
-                        return false;
-                    }
-                }
-                true
-            }
+            (UnpackedValue::Double(a), UnpackedValue::Double(b)) => a == b,
+            (UnpackedValue::Attrset(a), UnpackedValue::Attrset(b)) => unsafe {
+                *a.get() == *b.get()
+            },
+            (UnpackedValue::List(a), UnpackedValue::List(b)) => unsafe { *a.get() == *b.get() },
             (a, b) if a.kind() != b.kind() => false,
             (a, b) => throw!(
                 "== is not supported between values of type {} and {}",
@@ -796,9 +786,83 @@ impl Display for Value {
         self.unpack().fmt_display_rec(0, f)
     }
 }
-
 impl Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.unpack())
     }
+}
+
+#[macro_export]
+macro_rules! value {
+    ([$($tt: tt)*]) => {
+        UnpackedValue::new_list(#[allow(clippy::vec_init_then_push)] {
+            let mut _result = Vec::with_capacity(value!(@listcount 0; $($tt)*));
+            value!(@list _result; $($tt)*);
+            _result
+        }).pack()
+    };
+    ({$($tt: tt)*}) => {
+        UnpackedValue::new_attrset({
+            let mut _result = ValueMap::new();
+            value!(@map _result; $($tt)*);
+            _result
+        }).pack()
+    };
+    ($expr: expr) => { Value::from($expr) };
+
+    (@key [$key: expr]) => { $key };
+    (@key $key: ident) => { stringify!($key).to_string() };
+
+    (@listcount $current: expr; $value: expr$(, $($rest: tt)*)?) => { value!(@listcount $current + 1; $($($rest)*)?) };
+    (@listcount $current: expr;) => { $current };
+    (@list $out: ident; $value: tt $(, $($rest: tt)*)?) => {
+        $out.push(value!($value));
+        value!(@list $out; $($($rest)*)?)
+    };
+    (@list $out: ident; $value: expr $(, $($rest: tt)*)?) => {
+        $out.push(Value::from($value));
+        value!(@list $out; $($($rest)*)?)
+    };
+    (@list $out: ident;) => { };
+
+    (@map $out: ident; $key: tt = $value: tt; $($rest: tt)*) => {
+        $out.insert(value!(@key $key), value!($value));
+        value!(@map $out; $($rest)*);
+    };
+    (@map $out: ident; $key: tt = $value: expr; $($rest: tt)*) => {
+        $out.insert(Value::from(@key $key), value!($value));
+        value!(@map $out; $($rest)*);
+    };
+    (@map $out: ident;) => { };
+}
+
+#[test]
+fn test_value_macro() {
+    assert_eq!(value!(20), 20.into());
+    assert_eq!(value!("hello".to_string()), "hello".to_string().into());
+    assert_eq!(value!(253.11), 253.11.into());
+
+    assert_eq!(
+        value!([253.11, 1000]),
+        UnpackedValue::new_list(vec![value!(253.11), value!(1000)]).pack()
+    );
+
+    assert_eq!(
+        value!({
+            hello = 10;
+            ["computed key".to_string()] = [124, "1245"];
+            [9.to_string()] = {
+                even = false;
+                odd = true;
+            };
+        }),
+        UnpackedValue::new_attrset({
+            let mut result = ValueMap::new();
+            result.insert("hello".to_string(), 10.into());
+            result.insert("computed key".to_string(), value!([124, "1245"]));
+            result.insert(9.to_string(), value!({ even = false; odd = true; }));
+            result
+        })
+        .pack()
+    );
 }
