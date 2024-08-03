@@ -3,11 +3,11 @@ use std::{
 };
 
 use crate::{
-    throw, value::LazyValueImpl, Function, LazyValue, Scope, ScopeStorage, UnpackedValue, Value,
-    ValueList, ValueMap,
+    throw, value::LazyValueImpl, AttrsetValue, CreateValueMap, Function, LazyValue, Scope,
+    UnpackedValue, Value, ValueList, ValueMap,
 };
 
-use super::{CompiledParameter, Executable};
+use super::{CompiledParameter, Executable, COMPILER};
 
 // TODO: use extract_typed! more in this module
 
@@ -73,117 +73,85 @@ pub unsafe extern "C-unwind" fn create_function_scope(
     }
 }
 
-pub unsafe extern "C-unwind" fn scope_create(previous: *mut Scope) -> *mut Scope {
-    Scope::from_map(ValueMap::new(), previous)
-}
+// TODO: JIT this instead
+pub unsafe fn value_map_create(
+    mut scope: *mut Scope,
+    create: &CreateValueMap,
+) -> (Rc<UnsafeCell<ValueMap>>, *mut Scope) {
+    let result = Rc::new(UnsafeCell::new(ValueMap::new()));
 
-pub unsafe extern "C-unwind" fn scope_create_rec(
-    attrset: *mut UnsafeCell<ValueMap>,
-    previous: *mut Scope,
-) -> *mut Scope {
-    Scope::from_attrs(Rc::from_raw(attrset), previous)
-}
+    if create.rec {
+        scope = Scope::from_attrs(result.clone(), scope);
+    }
 
-pub unsafe extern "C-unwind" fn scope_set(
-    scope: *mut Scope,
-    key: *const u8,
-    key_len: usize,
-    value: *const Executable,
-) {
-    let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(key, key_len));
-    match &mut (*scope).storage {
-        ScopeStorage::Attrset => panic!("scope_set called on Attrset Scope"),
-        ScopeStorage::Scope(values) => values.insert(
-            name.to_string(),
-            UnpackedValue::Lazy(LazyValue::from_jit(scope, {
-                Rc::increment_strong_count(value);
-                Rc::from_raw(value)
-            }))
-            .pack(),
-        ),
-    };
-}
+    let lazy_parents = create
+        .parents
+        .iter()
+        .cloned()
+        // TODO: HACK: DO NOT DO THIS
+        .map(|x| unsafe { COMPILER.compile(x, None) }.unwrap())
+        .map(|x| LazyValue::from_jit(scope, x))
+        .collect::<Vec<_>>();
 
-pub unsafe extern "C-unwind" fn map_inherit_from(
-    scope: *mut Scope,
-    map: &mut ValueMap,
-    from: *const Executable,
-    what: *const String,
-    whatn: usize,
-) {
-    let what = std::slice::from_raw_parts(what, whatn);
+    {
+        let result_mut = &mut *result.get();
 
-    for key in what {
-        let from = {
-            Rc::increment_strong_count(from);
-            Rc::from_raw(from)
+        let to_value = |key: &str, value: &AttrsetValue| match value {
+            AttrsetValue::Load => Scope::lookup(scope, key),
+            AttrsetValue::Inherit(idx) => {
+                let key = key.to_string();
+                Value::from(lazy_parents[*idx].clone()).lazy_map(move |x| {
+                    if let UnpackedValue::Attrset(set) = x.into_evaluated().into_unpacked() {
+                        (*set.get()).get(&key).unwrap().clone()
+                    } else {
+                        throw!("Cannot inherit from non attribute set value")
+                    }
+                })
+            }
+            AttrsetValue::Childset(child) => {
+                UnpackedValue::Attrset(value_map_create(scope, child).0).pack()
+            }
+            AttrsetValue::Program(program) => {
+                // TODO: HACK: DO NOT DO THIS
+                LazyValue::from_jit(
+                    scope,
+                    unsafe { COMPILER.compile(program.clone(), None) }.unwrap(),
+                )
+                .into()
+            }
         };
-        map.insert(
-            key.to_string(),
-            UnpackedValue::Lazy(LazyValue::from_closure(move || {
-                let value = from.run(scope, &Value::NULL).unpack().into_evaluated();
-                let UnpackedValue::Attrset(attrs) = value else {
-                    panic!("map_inherit_from: not an attrset");
-                };
-                (*attrs.get())
-                    .get(key)
-                    .unwrap_or_else(|| throw!("inherit({:?}) {:?} missing", (*attrs.get()), key))
-                    .clone()
-            }))
-            .pack(),
-        );
+
+        for (key, value) in create.constant.iter() {
+            let value = to_value(&key, &value);
+            result_mut.insert(key.to_string(), value);
+        }
+
+        for (key, value) in create.dynamic.iter() {
+            // TODO: HACK: DO NOT DO THIS
+            let UnpackedValue::String(key) =
+                unsafe { COMPILER.compile(key.clone(), None).unwrap() }
+                    .run(scope, &Value::NULL)
+                    .into_unpacked()
+            else {
+                throw!("Non-string attrset key");
+            };
+            let value = to_value(&key, &value);
+            result_mut.insert(Rc::unwrap_or_clone(key), value);
+        }
     }
+
+    (result, scope)
 }
 
-pub unsafe extern "C-unwind" fn scope_inherit_parent(
-    scope: *mut Scope,
-    from: *mut Scope,
-    what: *const String,
-    whatn: usize,
-) {
-    let what = std::slice::from_raw_parts(what, whatn);
-    let values = match &mut (*scope).storage {
-        ScopeStorage::Attrset => panic!("scope_inherit_from called on Attrset Scope"),
-        ScopeStorage::Scope(values) => values,
-    };
-    for key in what {
-        values.insert(key.to_string(), Scope::lookup(from, key));
-    }
+pub unsafe extern "C-unwind" fn scope_create(
+    previous: *mut Scope,
+    create: *const CreateValueMap,
+) -> *mut Scope {
+    value_map_create(previous, &*create).1
 }
 
-pub unsafe extern "C-unwind" fn attrset_create() -> Value {
-    UnpackedValue::new_attrset(ValueMap::new()).pack()
-}
-
-pub unsafe extern "C-unwind" fn attrset_set(
-    map: &mut ValueMap,
-    scope: *mut Scope,
-    value: *const Executable,
-    name: Value,
-) {
-    let UnpackedValue::String(name) = name.unpack() else {
-        panic!("SetAttr called with non-string name")
-    };
-    map.insert(
-        Rc::unwrap_or_clone(name),
-        UnpackedValue::Lazy(LazyValue::from_jit(scope, {
-            Rc::increment_strong_count(value);
-            Rc::from_raw(value)
-        }))
-        .pack(),
-    );
-}
-
-pub unsafe extern "C-unwind" fn attrset_inherit_parent(
-    attrset: &mut ValueMap,
-    from: *mut Scope,
-    what: *const String,
-    whatn: usize,
-) {
-    let what = std::slice::from_raw_parts(what, whatn);
-    for key in what {
-        attrset.insert(key.to_string(), Scope::lookup(from, key));
-    }
+pub unsafe fn attrset_create(scope: *mut Scope, create: *const CreateValueMap) -> Value {
+    UnpackedValue::Attrset(value_map_create(scope, &*create).0).pack()
 }
 
 pub unsafe extern "C-unwind" fn attrset_get(
@@ -220,18 +188,6 @@ pub unsafe extern "C-unwind" fn attrset_get(
     }
 
     current
-}
-
-pub unsafe extern "C-unwind" fn attrset_get_or_insert_attrset(
-    map: &mut ValueMap,
-    name: Value,
-) -> Value {
-    let UnpackedValue::String(name) = name.unpack() else {
-        panic!("GetAttr called with non-string name")
-    };
-    map.entry(Rc::unwrap_or_clone(name))
-        .or_insert_with(|| UnpackedValue::new_attrset(ValueMap::new()).pack())
-        .clone()
 }
 
 unsafe fn attrset_hasattrpath_impl(map: &ValueMap, names: &[&String]) -> Value {

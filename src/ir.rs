@@ -1,12 +1,15 @@
-use std::{path::PathBuf, rc::Rc};
+use std::{collections::BTreeMap, iter::Peekable, path::PathBuf, rc::Rc};
 
 use rnix::{
-    ast::{AstToken, Attr, Attrpath, Expr, HasEntry, InterpolPart},
+    ast::{
+        AstToken, Attr, AttrSet, Attrpath, AttrpathValue, Expr, HasEntry, Inherit, InterpolPart,
+    },
     TextRange,
 };
+// NOTE: Importing this from rowan works but not from rnix...
 use rowan::ast::AstNode;
 
-use crate::{perfstats::measure_ir_generation_time, UnpackedValue, Value}; // NOTE: Importing this from rowan works but not from rnix...
+use crate::{perfstats::measure_ir_generation_time, UnpackedValue, Value};
 
 #[derive(Debug)]
 pub struct SourceFile {
@@ -22,8 +25,8 @@ pub struct SourceSpan {
     pub range: TextRange,
 }
 
-#[derive(Debug)]
-pub enum Parameter {
+#[derive(Debug, Clone)]
+pub(crate) enum Parameter {
     Ident(String),
     Pattern {
         entries: Vec<(String, Option<Program>)>,
@@ -32,16 +35,28 @@ pub enum Parameter {
     },
 }
 
-#[derive(Debug)]
-pub enum Operation {
+#[derive(Debug, Clone)]
+pub(crate) enum AttrsetValue {
+    Load,
+    Inherit(usize),
+    Childset(CreateValueMap),
+    Program(Program),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CreateValueMap {
+    pub(crate) rec: bool,
+    pub(crate) parents: Vec<Program>,
+    pub(crate) constant: Vec<(String, AttrsetValue)>,
+    pub(crate) dynamic: Vec<(Program, AttrsetValue)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Operation {
     Push(Value),
     // This is different from Push because this also sets the parent scope of the function
     PushFunction(Parameter, Program),
-    CreateAttrset {
-        rec: bool,
-    },
-    InheritAttrs(Option<Program>, Vec<String>),
-    SetAttrpath(usize, Program),
+    CreateAttrset(CreateValueMap),
     GetAttrConsume {
         components: usize,
         default: Option<Program>,
@@ -70,9 +85,7 @@ pub enum Operation {
     NotEqual,
     Implication(Program),
     Apply,
-    ScopePush,
-    ScopeInherit(Option<Program>, Vec<String>),
-    ScopeSet(String, Program),
+    ScopePush(CreateValueMap),
     // identifier lookup
     Load(String),
     ScopePop,
@@ -83,9 +96,15 @@ pub enum Operation {
     SourceSpanPop,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     pub(crate) operations: Vec<Operation>,
+}
+
+impl Program {
+    fn new() -> Self {
+        Self { operations: vec![] }
+    }
 }
 
 pub struct IRCompiler {
@@ -93,24 +112,180 @@ pub struct IRCompiler {
     source_file: Rc<SourceFile>,
 }
 
-// TODO: Notes on building attrsets
-// The reference nix implementation allows using attrpaths with the same prefix like this:
-// {
-//     a.a = 1;
-//     a.b = 1;
-// }
-// This is simple when there is no dynamic components on the path.
-// Fortunately, it is forbidden to do the same with dynamic components.
-// This means that the fastest way to compile an attrset build would be to build out a tree
-// structure from the attrpaths and probably compile known attributes statically into a base
-// attribute set which would then be filled with values and possible dynamic attributes.
-// I believe this would improve attrset building performance during runtime pretty significantly
+type ChildMap = BTreeMap<String, ChildNode>;
+enum ChildNode {
+    Attrset(AttrsetBuilder),
+    Value,
+}
 
-fn attr_assert_const(attr: Attr) -> String {
-    match attr {
-        Attr::Ident(x) => x.ident_token().unwrap().green().text().to_string(),
-        Attr::Dynamic(_) => todo!(),
-        Attr::Str(_) => todo!(),
+struct AttrsetBuilder {
+    create: CreateValueMap,
+    children: ChildMap,
+}
+
+impl AttrsetBuilder {
+    const fn new(rec: bool) -> Self {
+        Self {
+            create: CreateValueMap {
+                rec,
+                parents: vec![],
+                constant: vec![],
+                dynamic: vec![],
+            },
+            children: ChildMap::new(),
+        }
+    }
+
+    fn add_const_attr(&mut self, key: String, value: AttrsetValue) {
+        if self.children.contains_key(&key) {
+            panic!("invalid attribrute set construction")
+        }
+        self.children.insert(key.clone(), ChildNode::Value);
+        self.create.constant.push((key, value));
+    }
+
+    fn add_attr(&mut self, compiler: &IRCompiler, key: Attr, value: AttrsetValue) {
+        match compiler.create_maybe_const_attr(key) {
+            Ok(constant) => self.add_const_attr(constant, value),
+            Err(program) => {
+                self.create.dynamic.push((program, value));
+            }
+        }
+    }
+
+    fn inherit(
+        &mut self,
+        compiler: &IRCompiler,
+        from: Option<Program>,
+        attrs: impl IntoIterator<Item = Attr>,
+    ) {
+        for attr in attrs {
+            let value = if from.is_some() {
+                AttrsetValue::Inherit(self.create.parents.len())
+            } else {
+                AttrsetValue::Load
+            };
+
+            self.add_attr(compiler, attr, value);
+        }
+        if let Some(source) = from {
+            self.create.parents.push(source);
+        }
+    }
+
+    fn insert_new_attrset_child(&mut self, key: String, rec: bool) -> &mut AttrsetBuilder {
+        let ChildNode::Attrset(next) = self
+            .children
+            .entry(key)
+            .or_insert_with(|| ChildNode::Attrset(AttrsetBuilder::new(rec)))
+        else {
+            unreachable!()
+        };
+        next
+    }
+
+    fn create_dynamic_subset(
+        compiler: &IRCompiler,
+        mut subpath: Peekable<impl Iterator<Item = Attr>>,
+        value: Expr,
+    ) -> AttrsetValue {
+        if subpath.peek().is_none() {
+            AttrsetValue::Program(compiler.create_program(value))
+        } else {
+            let mut current = AttrsetBuilder::new(false);
+            current.pathvalue(compiler, subpath, value);
+            AttrsetValue::Childset(current.build())
+        }
+    }
+
+    fn pathvalue(
+        &mut self,
+        compiler: &IRCompiler,
+        mut attrpath: Peekable<impl Iterator<Item = Attr>>,
+        value: Expr,
+    ) {
+        let mut current = self;
+
+        while let Some(attr) = attrpath.next() {
+            match compiler.create_maybe_const_attr(attr) {
+                Ok(constant) if attrpath.peek().is_none() => {
+                    match value {
+                        Expr::AttrSet(set) => {
+                            // NOTE: This ignores the `rec` modifier on subsequent merges but nix does the same:
+                            //       https://github.com/NixOS/nix/issues/9020
+                            let builder = current
+                                .insert_new_attrset_child(constant, set.rec_token().is_some());
+                            builder.extend_from(compiler, set);
+                        }
+                        _ => current.add_const_attr(
+                            constant,
+                            AttrsetValue::Program(compiler.create_program(value)),
+                        ),
+                    }
+                    break;
+                }
+                Err(program) => {
+                    current.create.dynamic.push((
+                        program,
+                        Self::create_dynamic_subset(compiler, attrpath, value),
+                    ));
+                    break;
+                }
+                Ok(constant) => {
+                    current = current.insert_new_attrset_child(constant, false);
+                }
+            }
+        }
+    }
+
+    fn build(mut self) -> CreateValueMap {
+        for (key, child) in self.children {
+            match child {
+                ChildNode::Attrset(attrset) => self
+                    .create
+                    .constant
+                    .push((key, AttrsetValue::Childset(attrset.build()))),
+                ChildNode::Value => (),
+            }
+        }
+        self.create
+    }
+
+    fn build_whole(
+        compiler: &IRCompiler,
+        rec: bool,
+        inherits: impl IntoIterator<Item = Inherit>,
+        values: impl IntoIterator<Item = AttrpathValue>,
+    ) -> CreateValueMap {
+        let mut builder = Self::new(rec);
+        builder.extend_with(compiler, inherits, values);
+        builder.build()
+    }
+
+    fn extend_with(
+        &mut self,
+        compiler: &IRCompiler,
+        inherits: impl IntoIterator<Item = Inherit>,
+        values: impl IntoIterator<Item = AttrpathValue>,
+    ) {
+        for inherit in inherits {
+            let source = inherit
+                .from()
+                .and_then(|f| f.expr())
+                .map(|source| compiler.create_program(source));
+            self.inherit(compiler, source, inherit.attrs());
+        }
+        for attrvalue in values {
+            self.pathvalue(
+                compiler,
+                attrvalue.attrpath().unwrap().attrs().peekable(),
+                attrvalue.value().unwrap(),
+            );
+        }
+    }
+
+    fn extend_from(&mut self, compiler: &IRCompiler, attrset: AttrSet) {
+        self.extend_with(compiler, attrset.inherits(), attrset.attrpath_values())
     }
 }
 
@@ -190,6 +365,34 @@ impl IRCompiler {
         }
     }
 
+    fn create_maybe_const_string(
+        &self,
+        parts: Vec<InterpolPart<String>>,
+    ) -> Result<String, Program> {
+        match &parts[..] {
+            [InterpolPart::Literal(_)] => Ok(match parts.into_iter().next() {
+                Some(InterpolPart::Literal(x)) => x,
+                _ => unreachable!(),
+            }),
+            _ => {
+                let mut program = Program::new();
+                self.build_string(parts, |x| x, false, &mut program);
+                Err(program)
+            }
+        }
+    }
+
+    fn create_maybe_const_attr(&self, attr: Attr) -> Result<String, Program> {
+        match attr {
+            Attr::Ident(id) => Ok(id.ident_token().unwrap().green().text().to_string()),
+            Attr::Str(string) => self.create_maybe_const_string(string.normalized_parts()),
+            Attr::Dynamic(dynamic) => match dynamic.expr().unwrap() {
+                Expr::Str(string) => self.create_maybe_const_string(string.normalized_parts()),
+                expr => Err(self.create_program(expr)),
+            },
+        }
+    }
+
     fn build_program(&self, expr: Expr, program: &mut Program) {
         program
             .operations
@@ -262,26 +465,9 @@ impl IRCompiler {
             }
             Expr::LegacyLet(_) => todo!(),
             Expr::LetIn(x) => {
-                program.operations.push(Operation::ScopePush);
-                for inherit in x.inherits() {
-                    let source = inherit
-                        .from()
-                        .and_then(|f| f.expr())
-                        .map(|source| self.create_program(source));
-                    program.operations.push(Operation::ScopeInherit(
-                        source,
-                        inherit.attrs().map(attr_assert_const).collect(),
-                    ));
-                }
-                for entry in x.attrpath_values() {
-                    let mut it = entry.attrpath().unwrap().attrs();
-                    let name = attr_assert_const(it.next().unwrap());
-                    let value = entry.value().unwrap();
-                    let value_program = self.create_program(value);
-                    program
-                        .operations
-                        .push(Operation::ScopeSet(name, value_program));
-                }
+                let attrset =
+                    AttrsetBuilder::build_whole(self, true, x.inherits(), x.attrpath_values());
+                program.operations.push(Operation::ScopePush(attrset));
                 self.build_program(x.body().unwrap(), program);
                 program.operations.push(Operation::ScopePop);
             }
@@ -328,25 +514,13 @@ impl IRCompiler {
             }
             Expr::Paren(x) => self.build_program(x.expr().unwrap(), program),
             Expr::AttrSet(x) => {
-                program.operations.push(Operation::CreateAttrset {
-                    rec: x.rec_token().is_some(),
-                });
-                for inherit in x.inherits() {
-                    let source = inherit
-                        .from()
-                        .and_then(|f| f.expr())
-                        .map(|source| self.create_program(source));
-                    program.operations.push(Operation::InheritAttrs(
-                        source,
-                        inherit.attrs().map(attr_assert_const).collect(),
-                    ));
-                }
-                for keyvalue in x.attrpath_values() {
-                    let path = keyvalue.attrpath().unwrap();
-                    let value = self.create_program(keyvalue.value().unwrap());
-                    let n = self.build_attrpath(path, program);
-                    program.operations.push(Operation::SetAttrpath(n, value));
-                }
+                let attrset = AttrsetBuilder::build_whole(
+                    self,
+                    x.rec_token().is_some(),
+                    x.inherits(),
+                    x.attrpath_values(),
+                );
+                program.operations.push(Operation::CreateAttrset(attrset));
             }
             Expr::UnaryOp(x) => {
                 self.build_program(x.expr().unwrap(), program);

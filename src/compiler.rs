@@ -533,100 +533,12 @@ impl Compiler {
                     Operation::NotEqual => impl_binary_operator!(
                         comparison cmovne or Value::not_equal
                     ),
-                    Operation::CreateAttrset { rec } => {
+                    Operation::CreateAttrset(create) => {
+                        asm.mov(rdi, r15)?;
+                        asm.mov(rsi, Box::leak(Box::new(create)) as *const _ as u64)?;
                         call!(rust attrset_create);
                         asm.push(rax)?;
                         stack_values += 1;
-
-                        if rec {
-                            asm.mov(rdi, rax)?;
-                            asm.shl(rdi, 16)?;
-                            asm.shr(rdi, 16)?;
-                            asm.mov(rsi, r15)?;
-                            call!(rust scope_create_rec);
-                            asm.mov(r15, rax)?;
-                        }
-                    }
-                    Operation::SetAttrpath(components, value_program) => {
-                        let raw = closure.intern(_tc.pause(||self.compile(value_program, None))?);
-
-                        assert!(stack_values > components);
-                        asm.mov(rdi, qword_ptr(rsp + (8 * components)))?;
-
-                        let mut not_an_attrset = asm.create_label();
-                        for _ in 0..(components - 1) {
-                            unpack!(Attrset rdi, tmp = rbx, else => not_an_attrset);
-
-                            asm.pop(rsi)?;
-                            stack_values -= 1;
-                            // FIXME: THIS IS VERY WRONG!!!
-                            // nix-repl> x = { a = 1; }
-                            //
-                            // nix-repl> { a = x; a.l = 10; }
-                            // error: attribute 'a.l' already defined at «string»:1:3
-                            //
-                            //        at «string»:1:10:
-                            //
-                            //             1| { a = x; a.l = 10;
-                            call!(rust attrset_get_or_insert_attrset);
-                            asm.mov(rdi, rax)?;
-                        }
-
-                        unpack!(Attrset rdi, tmp = rbx, else => not_an_attrset);
-
-                        asm.mov(rsi, r15)?;
-                        asm.mov(rdx, raw as u64)?;
-                        asm.pop(rcx)?;
-                        stack_values -= 1;
-
-                        call!(rust attrset_set);
-
-                        let mut end = asm.create_label();
-                        asm.jmp(end)?;
-
-                        asm.set_label(&mut not_an_attrset)?;
-
-                        asm.mov(rdi, c"setattr called on non-attrset value".as_ptr() as u64)?;
-                        call!(rust asm_panic);
-
-                        asm.set_label(&mut end)?;
-                    }
-                    Operation::InheritAttrs(source, names) => {
-                        let names = Vec::leak(names);
-                        let mut not_an_attrset = asm.create_label();
-
-                        assert!(stack_values >= 1);
-                        asm.mov(rdi, qword_ptr(rsp))?;
-
-                        unpack!(Attrset rdi, tmp = rbx, else => not_an_attrset);
-
-                        let mut end = asm.create_label();
-                        if let Some(program) = source {
-                            asm.mov(rsi, rdi)?;
-                            asm.mov(rdi, r15)?;
-                            asm.mov(rdx, closure.intern(_tc.pause(||self.compile(program, None))?) as u64)?;
-                            asm.mov(rcx, names.as_ptr() as u64)?;
-                            asm.mov(r8, names.len() as u64)?;
-                            call!(rust map_inherit_from);
-                        } else {
-                            asm.mov(rsi, r15)?;
-                            asm.mov(rdx, names.as_ptr() as u64)?;
-                            asm.mov(rcx, names.len() as u64)?;
-                            call!(rust attrset_inherit_parent);
-                        };
-
-                        asm.jmp(end)?;
-
-                        asm.set_label(&mut not_an_attrset)?;
-
-                        asm.mov(
-                            rdi,
-                            c"inheritattr called on non-attrset value or non-attrset from".as_ptr()
-                                as u64,
-                        )?;
-                        call!(rust asm_panic);
-
-                        asm.set_label(&mut end)?;
                     }
                     Operation::GetAttrConsume { components, default } => {
                         let default = if let Some(program) = default {
@@ -761,36 +673,11 @@ impl Compiler {
 
                         asm.set_label(&mut end)?;
                     }
-                    Operation::ScopePush => {
+                    Operation::ScopePush(create) => {
                         asm.mov(rdi, r15)?;
+                        asm.mov(rsi, Box::leak(Box::new(create)) as *const _ as u64)?;
                         call!(rust scope_create);
                         asm.mov(r15, rax)?;
-                    }
-                    Operation::ScopeSet(name, value_program) => {
-                        let name = closure.intern(name);
-                        let raw = closure.intern(_tc.pause(||self.compile(value_program, None))?);
-                        asm.mov(rdi, r15)?;
-                        asm.mov(rsi, name.as_ptr() as u64)?;
-                        asm.mov(rdx, name.len() as u64)?;
-                        asm.mov(rcx, raw as u64)?;
-                        call!(rust scope_set);
-                    }
-                    Operation::ScopeInherit(from, names) => {
-                        let names = Vec::leak(names);
-                        if let Some(program) = from {
-                            asm.mov(rdi, r15)?;
-                            asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, values)))?;
-                            asm.mov(rdx, closure.intern(_tc.pause(||self.compile(program, None))?) as u64)?;
-                            asm.mov(rcx, names.as_ptr() as u64)?;
-                            asm.mov(r8, names.len() as u64)?;
-                            call!(rust map_inherit_from);
-                        } else {
-                            asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, previous)))?;
-                            asm.mov(rdi, r15)?;
-                            asm.mov(rdx, names.as_ptr() as u64)?;
-                            asm.mov(rcx, names.len() as u64)?;
-                            call!(rust scope_inherit_parent);
-                        };
                     }
                     Operation::ScopePop => {
                         // FIXME: make scopes rc or smth
