@@ -128,10 +128,10 @@ pub fn create_root_scope() -> *mut Scope {
             // FIXME: This error message is terrible (which argument?)
             $(
                 let fun = extract_typed!(
-                    Function(mut current);
+                    Function(move current);
                     concat!("builtin \"", $builtin_name, "\" expected {} argument but got {} instead")
                 );
-                current = unsafe { (fun.call)(current, $args) };
+                current = fun.run($args);
             )+
             current
         }};
@@ -810,7 +810,7 @@ pub fn import(path: PathBuf) -> Value {
         result.tree().expr().unwrap(),
     );
     let compiled = unsafe { COMPILER.compile(program, None).unwrap() };
-    ROOT_SCOPE.with(|root| compiled.run(*root, &Value::NULL))
+    ROOT_SCOPE.with(|root| unsafe { compiled.run(*root, Value::NULL) })
 }
 
 thread_local! {

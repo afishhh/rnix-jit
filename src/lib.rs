@@ -9,7 +9,6 @@
 #![feature(const_float_bits_conv)]
 
 /// Nothing in this API is stable.
-
 use std::{
     cell::UnsafeCell, fmt::Write as FmtWrite, mem::offset_of, ops::Deref, path::PathBuf, rc::Rc,
 };
@@ -24,6 +23,8 @@ pub mod value;
 use ir::*;
 use perfstats::measure_parsing_time;
 use value::*;
+mod interpreter;
+mod runnable;
 
 enum ScopeStorage {
     // Used for recursive attribute sets
@@ -186,5 +187,5 @@ pub fn eval(root: PathBuf, filename: String, code: String) -> Result<Value, NixE
     let expr = parse.tree().expr().unwrap();
     let program = IRCompiler::compile(root, filename, code, expr);
     let executable = unsafe { compiler::COMPILER.compile(program, None).unwrap() };
-    catch_nix_unwind(move || ROOT_SCOPE.with(move |s| executable.run(*s, &Value::NULL)))
+    catch_nix_unwind(move || ROOT_SCOPE.with(move |s| unsafe { executable.run(*s, Value::NULL) }))
 }

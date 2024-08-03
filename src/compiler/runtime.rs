@@ -3,8 +3,8 @@ use std::{
 };
 
 use crate::{
-    throw, value::LazyValueImpl, AttrsetValue, CreateValueMap, Function, LazyValue, Scope,
-    UnpackedValue, Value, ValueList, ValueMap,
+    runnable::Runnable, throw, value::LazyValueImpl, AttrsetValue, CreateValueMap, Function,
+    LazyValue, Scope, UnpackedValue, Value, ValueList, ValueMap,
 };
 
 use super::{CompiledParameter, Executable, COMPILER};
@@ -21,9 +21,9 @@ pub unsafe extern "C-unwind" fn scope_lookup(
 }
 
 pub unsafe extern "C-unwind" fn create_function_scope(
+    parameter: *const CompiledParameter,
     previous: *mut Scope,
     mut value: Value,
-    parameter: *const CompiledParameter,
 ) -> *mut Scope {
     match &*parameter {
         CompiledParameter::Ident(name) => {
@@ -130,7 +130,7 @@ pub unsafe fn value_map_create(
             // TODO: HACK: DO NOT DO THIS
             let UnpackedValue::String(key) =
                 unsafe { COMPILER.compile(key.clone(), None).unwrap() }
-                    .run(scope, &Value::NULL)
+                    .run(scope, Value::NULL)
                     .into_unpacked()
             else {
                 throw!("Non-string attrset key");
@@ -158,7 +158,7 @@ pub unsafe extern "C-unwind" fn attrset_get(
     values: *const Value,
     components: usize,
     scope: *mut Scope,
-    fallback: *const Executable,
+    fallback: *const Runnable<Executable>,
 ) -> Value {
     let mut current = values.add(components).read();
     for i in 0..components {
@@ -223,18 +223,16 @@ pub unsafe extern "C-unwind" fn attrset_update(left: &ValueMap, right: &ValueMap
 }
 
 pub unsafe extern "C-unwind" fn create_function_value(
-    executable: *const Executable,
+    runnable: *const Runnable,
     scope: *mut Scope,
 ) -> Value {
-    UnpackedValue::Function(Rc::new(Function {
-        call: (*executable).code(),
-        _executable: Some({
-            Rc::increment_strong_count(executable);
-            Rc::from_raw(executable)
-        }),
-        builtin_closure: None,
-        parent_scope: scope,
-    }))
+    UnpackedValue::Function(Rc::new(Function::new(
+        {
+            Rc::increment_strong_count(runnable);
+            Rc::from_raw(runnable)
+        },
+        scope,
+    )))
     .pack()
 }
 
@@ -245,7 +243,7 @@ pub unsafe extern "C-unwind" fn list_create() -> Value {
 pub unsafe extern "C-unwind" fn list_append_value(
     list: &mut ValueList,
     scope: *mut Scope,
-    executable: *const Executable,
+    executable: *const Runnable<Executable>,
 ) {
     list.push(
         UnpackedValue::Lazy(LazyValue::from_jit(scope, unsafe {

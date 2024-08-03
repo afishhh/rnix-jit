@@ -1,5 +1,4 @@
 use std::{
-    arch::asm,
     collections::BTreeMap,
     ffi::c_void,
     mem::offset_of,
@@ -7,8 +6,12 @@ use std::{
 };
 
 use crate::{
-    dwarf::*, exception::*, perfstats::measure_jit_codegen_time, unwind::*, Function, Operation,
-    Parameter, Program, Scope, SourceSpan, Value, ValueKind,
+    dwarf::*,
+    exception::*,
+    perfstats::measure_jit_codegen_time,
+    runnable::{Runnable, RunnableVTable},
+    unwind::*,
+    Function, Operation, Parameter, Program, Scope, SourceSpan, Value, ValueKind,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -20,7 +23,7 @@ use runtime::*;
 pub enum CompiledParameter {
     Ident(String),
     Pattern {
-        entries: Vec<(String, Option<Rc<Executable>>)>,
+        entries: Vec<(String, Option<Rc<Runnable<Executable>>>)>,
         binding: Option<String>,
         ignore_unmatched: bool,
     },
@@ -29,7 +32,7 @@ pub enum CompiledParameter {
 #[derive(Debug)]
 pub struct ExecutableClosure {
     _strings: Vec<String>,
-    _executables: Vec<Rc<Executable>>,
+    _runnables: Vec<Rc<Runnable<Executable>>>,
     _values: Vec<Value>,
     parameter: Option<Box<CompiledParameter>>,
 }
@@ -38,7 +41,7 @@ impl ExecutableClosure {
     pub fn new(parameter: Option<Box<CompiledParameter>>) -> ExecutableClosure {
         Self {
             _strings: Vec::new(),
-            _executables: Vec::new(),
+            _runnables: Vec::new(),
             _values: Vec::new(),
             parameter,
         }
@@ -71,11 +74,11 @@ impl ExecutableInternable for Value {
     }
 }
 
-impl ExecutableInternable for Rc<Executable> {
-    type Output = *const Executable;
+impl ExecutableInternable for Rc<Runnable<Executable>> {
+    type Output = *const Runnable<Executable>;
     fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
         let ptr = Rc::as_ptr(&self);
-        closure._executables.push(self);
+        closure._runnables.push(self);
         ptr
     }
 }
@@ -93,7 +96,7 @@ pub struct Executable {
     _closure: ExecutableClosure,
     eh_frame: Box<[u8]>,
     len: usize,
-    code: extern "C-unwind" fn(Value, Value) -> Value,
+    code: extern "C-unwind" fn(*const u8, *mut Scope, Value) -> Value,
     // start address -> (end address, source span) map
     source_map: BTreeMap<u64, (u64, SourceSpan)>,
 }
@@ -101,15 +104,24 @@ pub struct Executable {
 impl Executable {
     #[inline(always)]
     pub fn run(&self, scope: *mut Scope, arg: &Value) -> Value {
-        unsafe {
-            asm!("mov r10, {}", in(reg) scope, out("r10") _);
-            (self.code)(Value::NULL, Value::from_raw(arg.as_raw()))
-        }
+        unsafe { (self.code)(std::ptr::null(), scope, Value::from_raw(arg.as_raw())) }
     }
 
     #[inline(always)]
-    pub fn code(&self) -> unsafe extern "C-unwind" fn(Value, Value) -> Value {
-        self.code
+    pub fn runnable(self) -> Runnable<Executable> {
+        unsafe {
+            Runnable::new(
+                RunnableVTable {
+                    run: std::mem::transmute(self.code),
+                    drop_in_place: |this| {
+                        std::ptr::drop_in_place(
+                            (*Runnable::upcast::<Executable>(this)).inner.get(),
+                        );
+                    },
+                },
+                self,
+            )
+        }
     }
 
     #[inline(always)]
@@ -178,7 +190,7 @@ macro_rules! emit_asm {
 }
 
 pub struct Compiler {
-    source_maps: BTreeMap<u64, Weak<Executable>>,
+    source_maps: BTreeMap<u64, Weak<Runnable<Executable>>>,
 }
 
 impl Compiler {
@@ -193,14 +205,18 @@ impl Compiler {
             .range(..=address)
             .rev()
             .find_map(|(_, executable)| executable.upgrade())
-            .and_then(|executable| executable.source_span_for(address).cloned())
+            .and_then(|executable| {
+                unsafe { &*executable.inner.get() }
+                    .source_span_for(address)
+                    .cloned()
+            })
     }
 
     pub fn compile(
         &mut self,
         program: Program,
         param: Option<Parameter>,
-    ) -> Result<Rc<Executable>, IcedError> {
+    ) -> Result<Rc<Runnable<Executable>>, IcedError> {
         let mut _tc = measure_jit_codegen_time();
         // let debug_header = format!("{program:?}");
 
@@ -215,7 +231,7 @@ impl Compiler {
                     entries: entries
                         .into_iter()
                         .map(|(name, default)| {
-                            Ok::<(String, Option<Rc<Executable>>), IcedError>((
+                            Ok::<(String, _), IcedError>((
                                 name,
                                 default
                                     .map(|program| _tc.pause(|| self.compile(program, None)))
@@ -313,37 +329,15 @@ impl Compiler {
 
             if let Some(ref parameter) = closure.parameter {
                 let param = &**parameter as *const CompiledParameter;
-                // rdi = Current function Value (if a function)
-                // rsi = Argument Value (if a function)
+                // rsi = Parent scope
+                // rdx = Argument Value (if a function)
 
-                let mut not_a_function = asm.create_label();
-                let mut end = asm.create_label();
-
-                // SANITY CHECK: Make sure rdi is a function
-                asm.mov(rax, rdi)?;
-                unpack!(Function rax, tmp = rcx, else => not_a_function);
-
-                asm.mov(
-                    rdi,
-                    qword_ptr(
-                        rax + offset_of!(Function, parent_scope),
-                    ),
-                )?;
-                asm.mov(rdx, param as u64)?;
-
+                asm.mov(rdi, param as u64)?;
                 call!(rust create_function_scope);
                 asm.mov(r15, rax)?;
-                asm.jmp(end)?;
-
-                asm.set_label(&mut not_a_function)?;
-                asm.mov(rsi, rdi)?;
-                asm.mov(rdi, c"INTERNAL ERROR: Function receiver is not a Function".as_ptr() as u64)?;
-                call!(rust asm_panic_with_value);
-
-                asm.set_label(&mut end)?;
             } else {
-                // r10 contains our scope (set by the caller)
-                asm.mov(r15, r10)?;
+                // rsi = Parent scope
+                asm.mov(r15, rsi)?;
             }
 
             for operation in program.operations {
@@ -430,8 +424,8 @@ impl Compiler {
                     cmp rdi, r12;
                     jne shortcircuit_possible;
 
-                    mov r10, r15;
-                    { call!(rust unsafe { (*second).code }); }
+                    mov rsi, r15;
+                    { call!(rust unsafe { (*second).vtable.run }); }
                     mov rcx, rax;
                     shr rcx, 48;
                     cmp rcx, ValueKind::Bool.as_shifted() as i32;
@@ -610,20 +604,32 @@ impl Compiler {
                         asm.pop(rbx)?;
                         stack_values -= 1;
                         unlazy!(rbx, tmp = rdi);
-                        asm.pop(rsi)?;
+                        asm.pop(rdx)?;
                         stack_values -= 1;
 
                         let mut end = asm.create_label();
 
                         let mut not_a_function = asm.create_label();
 
-                        asm.mov(rdi, rbx)?;
+                        // rdi (1st param) = runnable ptr
+                        // rsi (2nd param) = invocation target scope
+                        // rdx (3rd param) = argument
                         unpack!(Function rbx, tmp = rcx, else => not_a_function);
                         asm.mov(
-                            rax,
+                            rdi,
                             qword_ptr(
-                                rbx + offset_of!(Function, call) as i32
+                                rbx + offset_of!(Function, runnable) as i32
                             ),
+                        )?;
+                        asm.mov(
+                            rsi,
+                            qword_ptr(
+                                rbx + offset_of!(Function, parent_scope) as i32
+                            )
+                        )?;
+                        asm.mov(
+                            rax,
+                            qword_ptr(rdi + offset_of!(Runnable, vtable.run) as i32)
                         )?;
                         call!(reg rax);
                         asm.push(rax)?;
@@ -699,13 +705,13 @@ impl Compiler {
                         unpack!(Bool rsi, tmp = rdx, else => not_a_boolean);
 
                         unsafe {
-                            asm.mov(rax, (*if_false).code() as u64)?;
-                            asm.mov(rbx, (*if_true).code() as u64)?;
+                            asm.mov(rax, (*if_false).vtable.run as u64)?;
+                            asm.mov(rbx, (*if_true).vtable.run as u64)?;
                         }
                         asm.cmp(esi, 0)?;
                         asm.cmovne(rax, rbx)?;
 
-                        asm.mov(r10, r15)?;
+                        asm.mov(rsi, r15)?;
                         call!(reg rax);
                         asm.push(rax)?;
                         asm.jmp(end)?;
@@ -1003,13 +1009,22 @@ impl Compiler {
             //     eprintln!("0x{start:x}-0x{end:x} -> {span:?}")
             // }
 
-            let rc = Rc::new(Executable {
-                _closure: closure,
-                eh_frame: frame,
-                code: std::mem::transmute(code_mem),
-                len: code.len(),
-                source_map,
-            });
+            let rc = Rc::new(Runnable::new(
+                RunnableVTable {
+                    run: std::mem::transmute(code_mem),
+                    drop_in_place: |this| {
+                        std::ptr::drop_in_place((*Runnable::upcast::<Executable>(this)).inner.get())
+                    },
+                },
+                Executable {
+                    _closure: closure,
+                    eh_frame: frame,
+                    // TODO: Use RunnableVTable.run instead
+                    code: std::mem::transmute(code_mem),
+                    len: code.len(),
+                    source_map,
+                },
+            ));
             self.source_maps.insert(code_mem as u64, Rc::downgrade(&rc));
             Ok(rc)
         }

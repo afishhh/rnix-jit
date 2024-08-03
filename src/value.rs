@@ -7,19 +7,37 @@ use std::{
     rc::Rc,
 };
 
-use crate::{compiler::Executable, throw, Scope};
+use crate::{compiler::Executable, runnable::Runnable, throw, Scope};
 
 pub struct Function {
-    pub(crate) call: unsafe extern "C-unwind" fn(Value, Value) -> Value,
-    pub(crate) _executable: Option<Rc<Executable>>,
-    pub(crate) builtin_closure: Option<Box<dyn FnMut(Value) -> Value>>,
-    pub(crate) parent_scope: *const Scope,
+    pub(crate) runnable: *const Runnable,
+    pub(crate) parent_scope: *mut Scope,
+}
+
+impl Function {
+    pub(crate) fn new(runnable: Rc<Runnable>, parent_scope: *mut Scope) -> Self {
+        Self {
+            runnable: Rc::into_raw(runnable),
+            parent_scope,
+        }
+    }
+
+    #[inline(always)]
+    pub fn run(&self, arg: Value) -> Value {
+        unsafe { (*self.runnable).run(self.parent_scope, arg) }
+    }
+}
+
+impl Drop for Function {
+    fn drop(&mut self) {
+        unsafe { Rc::from_raw(self.runnable) };
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum LazyValueImpl {
     Evaluated(Value),
-    LazyJIT((*mut Scope, Rc<Executable>)),
+    LazyRunnable((*mut Scope, Rc<Runnable>)),
     LazyBuiltin(MaybeUninit<Box<dyn FnOnce() -> Value>>),
 }
 
@@ -34,7 +52,7 @@ impl LazyValueImpl {
     fn evaluate(&mut self) -> &Value {
         match self {
             LazyValueImpl::Evaluated(value) => value,
-            LazyValueImpl::LazyJIT((scope, executable)) => {
+            LazyValueImpl::LazyRunnable((scope, runnable)) => {
                 LAZY_DEPTH.with(|x| unsafe {
                     let depth = &mut *x.get();
                     *depth += 1;
@@ -42,10 +60,8 @@ impl LazyValueImpl {
                         panic!("max lazy JIT depth exceeded");
                     };
                 });
-                // eprintln!("evaluating lazy JIT executable");
-                let result = (**executable).run(*scope, &Value::NULL).into_evaluated();
+                let result = unsafe { runnable.run(*scope, Value::NULL) }.into_evaluated();
                 *self = LazyValueImpl::Evaluated(result);
-                // eprintln!("evaluated lazy JIT executable");
                 LAZY_DEPTH.with(|x| unsafe {
                     let depth = &mut *x.get();
                     *depth -= 1;
@@ -78,9 +94,10 @@ impl LazyValueImpl {
 }
 
 impl LazyValue {
-    pub(crate) fn from_jit(scope: *mut Scope, rc: Rc<Executable>) -> LazyValue {
-        Self(Rc::new(UnsafeCell::new(LazyValueImpl::LazyJIT((
-            scope, rc,
+    pub(crate) fn from_jit(scope: *mut Scope, rc: Rc<Runnable<Executable>>) -> LazyValue {
+        Self(Rc::new(UnsafeCell::new(LazyValueImpl::LazyRunnable((
+            scope,
+            unsafe { Rc::from_raw(Runnable::erase(Rc::into_raw(rc))) },
         )))))
     }
 
@@ -197,15 +214,6 @@ where
     }
 }
 
-unsafe extern "C-unwind" fn call_builtin(fun: Value, value: Value) -> Value {
-    let this = (fun.0 & !VALUE_TAG_MASK) as *mut Function;
-    // eprintln!(
-    //     "call_builtin HeapValue:{:?} arg:{value:?}",
-    //     this as *const _
-    // );
-    ((*this).builtin_closure.as_mut().unwrap_unchecked())(value)
-}
-
 impl UnpackedValue {
     pub fn new_string(value: String) -> UnpackedValue {
         UnpackedValue::String(Rc::new(value))
@@ -224,12 +232,9 @@ impl UnpackedValue {
     }
 
     pub fn new_function(function: impl FnMut(Value) -> Value + 'static) -> UnpackedValue {
-        UnpackedValue::Function(Rc::new(Function {
-            call: call_builtin,
-            _executable: None,
-            builtin_closure: Some(Box::new(function)),
-            parent_scope: std::ptr::null_mut(),
-        }))
+        let rc = Rc::new(Runnable::from_closure(function));
+        let rc = unsafe { Rc::from_raw(Runnable::erase(Rc::into_raw(rc))) };
+        UnpackedValue::Function(Rc::new(Function::new(rc, std::ptr::null_mut())))
     }
 
     pub fn kind(&self) -> ValueKind {
