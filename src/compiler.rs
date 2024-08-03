@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    dwarf::*, exception::*, perfstats::measure_jit_codegen_time, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan, Value, ValueKind
+    dwarf::*, exception::*, perfstats::measure_jit_codegen_time, unwind::*, Function, Operation,
+    Parameter, Program, Scope, SourceSpan, Value, ValueKind,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -200,7 +201,7 @@ impl Compiler {
         program: Program,
         param: Option<Parameter>,
     ) -> Result<Rc<Executable>, IcedError> {
-        let _tc = measure_jit_codegen_time();
+        let mut _tc = measure_jit_codegen_time();
         // let debug_header = format!("{program:?}");
 
         let mut closure = ExecutableClosure::new(param.map(|param| {
@@ -217,7 +218,7 @@ impl Compiler {
                             Ok::<(String, Option<Rc<Executable>>), IcedError>((
                                 name,
                                 default
-                                    .map(|program| self.compile(program, None))
+                                    .map(|program| _tc.pause(|| self.compile(program, None)))
                                     .transpose()?,
                             ))
                         })
@@ -418,7 +419,7 @@ impl Compiler {
                     )
                 }};
                 (boolean $second: expr, shortcircuit(rdi = $value: expr) => $sresult: expr, else(rax) => $nresult: expr) => {emit_asm!(asm, {
-                    { let second = closure.intern(self.compile($second, None)?); }
+                    { let second = closure.intern(_tc.pause(||self.compile($second, None))?); }
 
                     pop rdi;
                     {
@@ -468,7 +469,7 @@ impl Compiler {
                         stack_values += 1;
                     }
                     Operation::PushFunction(param, program) => {
-                        let raw = closure.intern(self.compile(program, Some(param))?);
+                        let raw = closure.intern(_tc.pause(||self.compile(program, Some(param)))?);
                         asm.mov(rdi, raw as u64)?;
                         asm.mov(rsi, r15)?;
                         call!(rust create_function_value);
@@ -547,7 +548,7 @@ impl Compiler {
                         }
                     }
                     Operation::SetAttrpath(components, value_program) => {
-                        let raw = closure.intern(self.compile(value_program, None)?);
+                        let raw = closure.intern(_tc.pause(||self.compile(value_program, None))?);
 
                         assert!(stack_values > components);
                         asm.mov(rdi, qword_ptr(rsp + (8 * components)))?;
@@ -603,7 +604,7 @@ impl Compiler {
                         if let Some(program) = source {
                             asm.mov(rsi, rdi)?;
                             asm.mov(rdi, r15)?;
-                            asm.mov(rdx, closure.intern(self.compile(program, None)?) as u64)?;
+                            asm.mov(rdx, closure.intern(_tc.pause(||self.compile(program, None))?) as u64)?;
                             asm.mov(rcx, names.as_ptr() as u64)?;
                             asm.mov(r8, names.len() as u64)?;
                             call!(rust map_inherit_from);
@@ -629,7 +630,7 @@ impl Compiler {
                     }
                     Operation::GetAttrConsume { components, default } => {
                         let default = if let Some(program) = default {
-                            closure.intern(self.compile(program, None)?)
+                            closure.intern(_tc.pause(||self.compile(program, None))?)
                         } else { std::ptr::null() };
 
                         assert!(stack_values > components);
@@ -739,7 +740,7 @@ impl Compiler {
                         stack_values += 1;
                     }
                     Operation::ListAppend(value_program) => {
-                        let raw = closure.intern(self.compile(value_program, None)?);
+                        let raw = closure.intern(_tc.pause(||self.compile(value_program, None))?);
 
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
@@ -767,7 +768,7 @@ impl Compiler {
                     }
                     Operation::ScopeSet(name, value_program) => {
                         let name = closure.intern(name);
-                        let raw = closure.intern(self.compile(value_program, None)?);
+                        let raw = closure.intern(_tc.pause(||self.compile(value_program, None))?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, name.as_ptr() as u64)?;
                         asm.mov(rdx, name.len() as u64)?;
@@ -779,7 +780,7 @@ impl Compiler {
                         if let Some(program) = from {
                             asm.mov(rdi, r15)?;
                             asm.mov(rsi, qword_ptr(r15 + offset_of!(Scope, values)))?;
-                            asm.mov(rdx, closure.intern(self.compile(program, None)?) as u64)?;
+                            asm.mov(rdx, closure.intern(_tc.pause(||self.compile(program, None))?) as u64)?;
                             asm.mov(rcx, names.as_ptr() as u64)?;
                             asm.mov(r8, names.len() as u64)?;
                             call!(rust map_inherit_from);
@@ -797,8 +798,8 @@ impl Compiler {
                     }
                     Operation::IfElse(if_true, if_false) => {
                         // TODO: inline these into this executable instead
-                        let if_true = closure.intern(self.compile(if_true, None)?);
-                        let if_false = closure.intern(self.compile(if_false, None)?);
+                        let if_true = closure.intern(_tc.pause(||self.compile(if_true, None))?);
+                        let if_false = closure.intern(_tc.pause(||self.compile(if_false, None))?);
 
                         assert!(stack_values >= 1);
                         asm.pop(rsi)?;

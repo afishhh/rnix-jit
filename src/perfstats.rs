@@ -17,6 +17,14 @@ pub struct TimeCounter {
 }
 
 impl TimeCounter {
+    pub fn pause<T>(&mut self, fun: impl FnOnce() -> T) -> T {
+        unsafe {
+            *self.slot += Instant::now() - self.start;
+        }
+        let result = fun();
+        self.start = Instant::now();
+        result
+    }
     pub fn stop(self) {}
 }
 
