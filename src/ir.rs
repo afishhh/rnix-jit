@@ -36,19 +36,61 @@ pub(crate) enum Parameter {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum AttrsetValue {
+pub(crate) enum AttrsetValue<R = Program> {
     Load,
     Inherit(usize),
-    Childset(CreateValueMap),
-    Program(Program),
+    Childset(CreateValueMap<R>),
+    Program(R),
 }
 
+// FIXME: Is this truly what we want to do?
+//        Not the cleanest thing in the world.
 #[derive(Debug, Clone)]
-pub(crate) struct CreateValueMap {
+pub(crate) struct CreateValueMap<R = Program> {
     pub(crate) rec: bool,
-    pub(crate) parents: Vec<Program>,
-    pub(crate) constant: Vec<(String, AttrsetValue)>,
-    pub(crate) dynamic: Vec<(Program, AttrsetValue)>,
+    pub(crate) parents: Vec<R>,
+    pub(crate) constant: Vec<(String, AttrsetValue<R>)>,
+    pub(crate) dynamic: Vec<(R, AttrsetValue<R>)>,
+}
+
+impl<T> AttrsetValue<T> {
+    fn transpile<U, E>(
+        self,
+        transpiler: &mut impl FnMut(T) -> Result<U, E>,
+    ) -> Result<AttrsetValue<U>, E> {
+        Ok(match self {
+            AttrsetValue::Load => AttrsetValue::<U>::Load,
+            AttrsetValue::Inherit(x) => AttrsetValue::<U>::Inherit(x),
+            AttrsetValue::Childset(create) => AttrsetValue::Childset(create.transpile(transpiler)?),
+            AttrsetValue::Program(t) => AttrsetValue::Program(transpiler(t)?),
+        })
+    }
+}
+
+impl<T> CreateValueMap<T> {
+    pub(crate) fn transpile<U, E>(
+        self,
+        transpiler: &mut impl FnMut(T) -> Result<U, E>,
+    ) -> Result<CreateValueMap<U>, E> {
+        Ok(CreateValueMap::<U> {
+            rec: self.rec,
+            parents: self
+                .parents
+                .into_iter()
+                .map(&mut *transpiler)
+                .collect::<Result<_, E>>()?,
+            constant: self
+                .constant
+                .into_iter()
+                .map(|(key, value)| Ok((key, value.transpile(transpiler)?)))
+                .collect::<Result<_, E>>()?,
+            dynamic: self
+                .dynamic
+                .into_iter()
+                .map(|(key, value)| Ok((transpiler(key)?, value.transpile(transpiler)?)))
+                .collect::<Result<_, E>>()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -7,7 +7,7 @@ use crate::{
     LazyValue, Scope, UnpackedValue, Value, ValueList, ValueMap,
 };
 
-use super::{CompiledParameter, Executable, COMPILER};
+use super::{CompiledParameter, Executable};
 
 // TODO: use extract_typed! more in this module
 
@@ -52,7 +52,7 @@ pub unsafe extern "C-unwind" fn create_function_scope(
                 let Some(value) = value.cloned().or_else(|| {
                     default
                         .as_ref()
-                        .map(|x| LazyValue::from_jit(scope, x.clone()).into())
+                        .map(|x| LazyValue::from_runnable(scope, x.clone()).into())
                 }) else {
                     panic!("missing pattern entry");
                 };
@@ -76,7 +76,7 @@ pub unsafe extern "C-unwind" fn create_function_scope(
 // TODO: JIT this instead
 pub unsafe fn value_map_create(
     mut scope: *mut Scope,
-    create: &CreateValueMap,
+    create: &CreateValueMap<Rc<Runnable>>,
 ) -> (Rc<UnsafeCell<ValueMap>>, *mut Scope) {
     let result = Rc::new(UnsafeCell::new(ValueMap::new()));
 
@@ -87,16 +87,13 @@ pub unsafe fn value_map_create(
     let lazy_parents = create
         .parents
         .iter()
-        .cloned()
-        // TODO: HACK: DO NOT DO THIS
-        .map(|x| unsafe { COMPILER.compile(x, None) }.unwrap())
-        .map(|x| LazyValue::from_jit(scope, x))
+        .map(|x| LazyValue::from_runnable(scope, x.clone()))
         .collect::<Vec<_>>();
 
     {
         let result_mut = &mut *result.get();
 
-        let to_value = |key: &str, value: &AttrsetValue| match value {
+        let to_value = |key: &str, value: &AttrsetValue<Rc<Runnable>>| match value {
             AttrsetValue::Load => Scope::lookup(scope, key),
             AttrsetValue::Inherit(idx) => {
                 let key = key.to_string();
@@ -111,13 +108,8 @@ pub unsafe fn value_map_create(
             AttrsetValue::Childset(child) => {
                 UnpackedValue::Attrset(value_map_create(scope, child).0).pack()
             }
-            AttrsetValue::Program(program) => {
-                // TODO: HACK: DO NOT DO THIS
-                LazyValue::from_jit(
-                    scope,
-                    unsafe { COMPILER.compile(program.clone(), None) }.unwrap(),
-                )
-                .into()
+            AttrsetValue::Program(runnable) => {
+                LazyValue::from_runnable(scope, runnable.clone()).into()
             }
         };
 
@@ -127,12 +119,7 @@ pub unsafe fn value_map_create(
         }
 
         for (key, value) in create.dynamic.iter() {
-            // TODO: HACK: DO NOT DO THIS
-            let UnpackedValue::String(key) =
-                unsafe { COMPILER.compile(key.clone(), None).unwrap() }
-                    .run(scope, Value::NULL)
-                    .into_unpacked()
-            else {
+            let UnpackedValue::String(key) = key.run(scope, Value::NULL).into_unpacked() else {
                 throw!("Non-string attrset key");
             };
             let value = to_value(&key, &value);
@@ -145,12 +132,15 @@ pub unsafe fn value_map_create(
 
 pub unsafe extern "C-unwind" fn scope_create(
     previous: *mut Scope,
-    create: *const CreateValueMap,
+    create: *const CreateValueMap<Rc<Runnable>>,
 ) -> *mut Scope {
     value_map_create(previous, &*create).1
 }
 
-pub unsafe fn attrset_create(scope: *mut Scope, create: *const CreateValueMap) -> Value {
+pub unsafe fn attrset_create(
+    scope: *mut Scope,
+    create: *const CreateValueMap<Rc<Runnable>>,
+) -> Value {
     UnpackedValue::Attrset(value_map_create(scope, &*create).0).pack()
 }
 
@@ -174,7 +164,7 @@ pub unsafe extern "C-unwind" fn attrset_get(
                         if fallback.is_null() {
                             throw!("{map:?}.{name:?} does not exist")
                         } else {
-                            return LazyValue::from_jit(scope, unsafe {
+                            return LazyValue::from_runnable(scope, unsafe {
                                 Rc::increment_strong_count(fallback);
                                 Rc::from_raw(fallback)
                             })
@@ -246,7 +236,7 @@ pub unsafe extern "C-unwind" fn list_append_value(
     executable: *const Runnable<Executable>,
 ) {
     list.push(
-        UnpackedValue::Lazy(LazyValue::from_jit(scope, unsafe {
+        UnpackedValue::Lazy(LazyValue::from_runnable(scope, unsafe {
             Rc::increment_strong_count(executable);
             Rc::from_raw(executable)
         }))

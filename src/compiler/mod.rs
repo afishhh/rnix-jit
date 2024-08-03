@@ -11,7 +11,7 @@ use crate::{
     perfstats::measure_jit_codegen_time,
     runnable::{Runnable, RunnableVTable},
     unwind::*,
-    Function, Operation, Parameter, Program, Scope, SourceSpan, Value, ValueKind,
+    CreateValueMap, Function, Operation, Parameter, Program, Scope, SourceSpan, Value, ValueKind,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -33,6 +33,8 @@ pub enum CompiledParameter {
 pub struct ExecutableClosure {
     _strings: Vec<String>,
     _runnables: Vec<Rc<Runnable<Executable>>>,
+    // TODO: properly jit compile this instead
+    _create_value_map: Vec<Box<CreateValueMap<Rc<Runnable<Executable>>>>>,
     _values: Vec<Value>,
     parameter: Option<Box<CompiledParameter>>,
 }
@@ -42,6 +44,7 @@ impl ExecutableClosure {
         Self {
             _strings: Vec::new(),
             _runnables: Vec::new(),
+            _create_value_map: Vec::new(),
             _values: Vec::new(),
             parameter,
         }
@@ -79,6 +82,17 @@ impl ExecutableInternable for Rc<Runnable<Executable>> {
     fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
         let ptr = Rc::as_ptr(&self);
         closure._runnables.push(self);
+        ptr
+    }
+}
+
+impl ExecutableInternable for CreateValueMap<Rc<Runnable<Executable>>> {
+    type Output = *const CreateValueMap<Rc<Runnable<Executable>>>;
+
+    fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
+        let b = Box::new(self);
+        let ptr = &*b as *const _;
+        closure._create_value_map.push(b);
         ptr
     }
 }
@@ -528,8 +542,9 @@ impl Compiler {
                         comparison cmovne or Value::not_equal
                     ),
                     Operation::CreateAttrset(create) => {
+                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
                         asm.mov(rdi, r15)?;
-                        asm.mov(rsi, Box::leak(Box::new(create)) as *const _ as u64)?;
+                        asm.mov(rsi, create as *const _ as u64)?;
                         call!(rust attrset_create);
                         asm.push(rax)?;
                         stack_values += 1;
@@ -680,8 +695,9 @@ impl Compiler {
                         asm.set_label(&mut end)?;
                     }
                     Operation::ScopePush(create) => {
+                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
                         asm.mov(rdi, r15)?;
-                        asm.mov(rsi, Box::leak(Box::new(create)) as *const _ as u64)?;
+                        asm.mov(rsi, create as *const _ as u64)?;
                         call!(rust scope_create);
                         asm.mov(r15, rax)?;
                     }

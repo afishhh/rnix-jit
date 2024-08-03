@@ -94,7 +94,8 @@ impl LazyValueImpl {
 }
 
 impl LazyValue {
-    pub(crate) fn from_jit(scope: *mut Scope, rc: Rc<Runnable<Executable>>) -> LazyValue {
+    #[inline(always)]
+    pub(crate) fn from_runnable<R>(scope: *mut Scope, rc: Rc<Runnable<R>>) -> LazyValue {
         Self(Rc::new(UnsafeCell::new(LazyValueImpl::LazyRunnable((
             scope,
             unsafe { Rc::from_raw(Runnable::erase(Rc::into_raw(rc))) },

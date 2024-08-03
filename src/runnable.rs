@@ -62,7 +62,6 @@ impl<F: FnMut(Value) -> Value + 'static> Runnable<F> {
             _scope: *mut Scope,
             arg: Value,
         ) -> Value {
-            eprintln!("Runnable::<FnMut(Value) -> Value + 'static>::run() called with arg {arg:?}");
             (*(*Runnable::upcast::<F>(this)).inner.get())(arg)
         }
 
