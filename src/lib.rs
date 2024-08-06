@@ -173,19 +173,5 @@ pub use builtins::{import, seq};
 pub use exception::catch_nix_unwind;
 
 pub fn eval(root: PathBuf, filename: String, code: String) -> Result<Value, NixException> {
-    let parse = {
-        let _tc = measure_parsing_time();
-        rnix::Root::parse(&code)
-    };
-    if !parse.errors().is_empty() {
-        let mut msg = "parse errors encountered:\n".to_string();
-        for (i, error) in parse.errors().iter().enumerate() {
-            writeln!(msg, "{}. {}", i + 1, error).unwrap();
-        }
-        return Err(NixException::new(msg));
-    }
-    let expr = parse.tree().expr().unwrap();
-    let program = IRCompiler::compile(root, filename, code, expr);
-    let executable = unsafe { compiler::COMPILER.compile(program, None).unwrap() };
-    catch_nix_unwind(move || ROOT_SCOPE.with(move |s| unsafe { executable.run(*s, Value::NULL) }))
+    catch_nix_unwind(move || builtins::eval_throwing(root, filename, code))
 }

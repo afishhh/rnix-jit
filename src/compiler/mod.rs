@@ -122,23 +122,6 @@ impl Executable {
     }
 
     #[inline(always)]
-    pub fn runnable(self) -> Runnable<Executable> {
-        unsafe {
-            Runnable::new(
-                RunnableVTable {
-                    run: std::mem::transmute(self.code),
-                    drop_in_place: |this| {
-                        std::ptr::drop_in_place(
-                            (*Runnable::upcast::<Executable>(this)).inner.get(),
-                        );
-                    },
-                },
-                self,
-            )
-        }
-    }
-
-    #[inline(always)]
     pub fn code_address_range(&self) -> (u64, u64) {
         (self.code as u64, self.code as u64 + self.len as u64)
     }
@@ -439,7 +422,7 @@ impl Compiler {
                     jne shortcircuit_possible;
 
                     mov rsi, r15;
-                    { call!(rust unsafe { (*second).vtable.run }); }
+                    { call!(rust unsafe { (*second).vtable().run }); }
                     mov rcx, rax;
                     shr rcx, 48;
                     cmp rcx, ValueKind::Bool.as_shifted() as i32;
@@ -644,7 +627,11 @@ impl Compiler {
                         )?;
                         asm.mov(
                             rax,
-                            qword_ptr(rdi + offset_of!(Runnable, vtable.run) as i32)
+                            qword_ptr(
+                                rdi
+                                + offset_of!(Runnable, vtable) as i32
+                                + offset_of!(RunnableVTable, run) as i32
+                            )
                         )?;
                         call!(reg rax);
                         asm.push(rax)?;
@@ -721,8 +708,8 @@ impl Compiler {
                         unpack!(Bool rsi, tmp = rdx, else => not_a_boolean);
 
                         unsafe {
-                            asm.mov(rax, (*if_false).vtable.run as u64)?;
-                            asm.mov(rbx, (*if_true).vtable.run as u64)?;
+                            asm.mov(rax, (*if_false).vtable().run as u64)?;
+                            asm.mov(rbx, (*if_true).vtable().run as u64)?;
                         }
                         asm.cmp(esi, 0)?;
                         asm.cmovne(rax, rbx)?;

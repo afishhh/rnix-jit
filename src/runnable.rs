@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, marker::PhantomData, mem::ManuallyDrop};
+use std::{cell::UnsafeCell, marker::PhantomData, mem::ManuallyDrop, rc::Rc};
 
 use crate::{Scope, Value};
 
@@ -7,10 +7,21 @@ type RunMethodPtr =
 
 type DropMethodPtr = fn(runnable: *const Runnable);
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) struct RunnableVTable {
     pub(crate) run: RunMethodPtr,
     pub(crate) drop_in_place: DropMethodPtr,
+}
+
+impl RunnableVTable {
+    pub fn with_default_drop<T>(run: RunMethodPtr) -> Self {
+        Self {
+            run,
+            drop_in_place: |this| unsafe {
+                std::ptr::drop_in_place((*Runnable::upcast::<T>(this)).inner.get())
+            },
+        }
+    }
 }
 
 // Basically a simple trait but with a custom vtable
@@ -19,7 +30,7 @@ pub(crate) struct RunnableVTable {
 pub struct Runnable<T = ()> {
     // Make this !Send
     _marker: PhantomData<*const u8>,
-    pub(crate) vtable: RunnableVTable,
+    pub(crate) vtable: UnsafeCell<RunnableVTable>,
     pub(crate) inner: UnsafeCell<ManuallyDrop<T>>,
 }
 
@@ -27,14 +38,25 @@ impl<T> Runnable<T> {
     pub(crate) unsafe fn new(vtable: RunnableVTable, value: T) -> Self {
         Self {
             _marker: PhantomData,
-            vtable,
+            vtable: UnsafeCell::new(vtable),
             inner: UnsafeCell::new(ManuallyDrop::new(value)),
         }
     }
 
+    pub(crate) unsafe fn new_erased_rc(vtable: RunnableVTable, value: T) -> Rc<Runnable> {
+        Rc::from_raw(Runnable::erase(Rc::into_raw(Rc::new(Self::new(
+            vtable, value,
+        )))))
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn vtable(&self) -> &RunnableVTable {
+        unsafe { &(*self.vtable.get()) }
+    }
+
     #[inline(always)]
     pub(crate) unsafe fn run(&self, scope: *mut Scope, arg: Value) -> Value {
-        (self.vtable.run)(Self::erase(self), scope, arg)
+        (self.vtable().run)(Self::erase(self), scope, arg)
     }
 
     #[inline(always)]
@@ -51,7 +73,7 @@ impl Runnable {
 
 impl<T> Drop for Runnable<T> {
     fn drop(&mut self) {
-        (self.vtable.drop_in_place)(Self::erase(self))
+        unsafe { (self.vtable().drop_in_place)(Self::erase(self)) }
     }
 }
 

@@ -93,6 +93,8 @@ impl<T> CreateValueMap<T> {
     }
 }
 
+// TODO: Make Programs live in an Arena
+
 #[derive(Debug, Clone)]
 pub(crate) enum Operation {
     Push(Value),

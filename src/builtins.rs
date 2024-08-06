@@ -1,15 +1,18 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env::VarError;
-use std::path::PathBuf;
-use std::rc::Rc;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    env::VarError,
+    fmt::Write,
+    path::PathBuf,
+    rc::Rc,
+};
 
 use regex::Regex;
 
-use crate::perfstats::measure_parsing_time;
 use crate::{
     compiler::COMPILER, throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind,
     ValueMap,
 };
+use crate::{perfstats::measure_parsing_time, LazyValue};
 
 fn human_valuekind(kind: ValueKind) -> &'static str {
     match kind {
@@ -137,6 +140,15 @@ pub fn create_root_scope() -> *mut Scope {
         }};
     }
 
+    macro_rules! lazy_call_value {
+        ($builtin_name: literal, $value: expr $(, $args: expr)+) => {{
+            let value = $value;
+            LazyValue::from_closure(move || {
+                call_value!($builtin_name, value, $($args),+)
+            }).into()
+        }};
+    }
+
     macro_rules! make_builtins {
         (
             $(
@@ -176,10 +188,9 @@ pub fn create_root_scope() -> *mut Scope {
         #[toplevel_alias]
         fn map(mapper: Value, list: List) {
             list.iter()
-                .map(|x| {
+                .map(|x| -> Value {
                     let mapper = mapper.clone();
-                    x.clone()
-                        .lazy_map(move |x| call_value!("map", mapper.clone(), x))
+                    lazy_call_value!("map", mapper.clone(), x.clone())
                 })
                 .collect::<Value>()
         }
@@ -356,7 +367,7 @@ pub fn create_root_scope() -> *mut Scope {
                     .iter()
                 })
                 .cloned()
-                .map(|value| call_value!("concatMap", mapper.clone(), value))
+                .map(|value| -> Value { lazy_call_value!("concatMap", mapper.clone(), value) })
                 .collect::<Value>()
         }
 
@@ -383,7 +394,7 @@ pub fn create_root_scope() -> *mut Scope {
         fn genList(generator: Value, n: Integer) {
             let mut result = vec![];
             for i in 0..n {
-                result.push(call_value!("genList", generator.clone(), i.into()))
+                result.push(lazy_call_value!("genList", generator.clone(), i.into()))
             }
             UnpackedValue::new_list(result)
         }
@@ -549,9 +560,10 @@ pub fn create_root_scope() -> *mut Scope {
         fn mapAttrs(mapper: Value, attrs: Attrset) {
             let mut result = ValueMap::new();
             for (key, value) in attrs {
+                let mapper = mapper.clone();
                 result.insert(
                     key.to_string(),
-                    call_value!(
+                    lazy_call_value!(
                         "mapAttrs",
                         mapper.clone(),
                         UnpackedValue::new_string(key.clone()).pack(),
@@ -789,6 +801,24 @@ pub fn seq(value: &Value, deep: bool) {
     }
 }
 
+pub(crate) fn eval_throwing(root: PathBuf, filename: String, code: String) -> Value {
+    let parse = {
+        let _tc = measure_parsing_time();
+        rnix::Root::parse(&code)
+    };
+    if !parse.errors().is_empty() {
+        let mut msg = "parse errors encountered:\n".to_string();
+        for (i, error) in parse.errors().iter().enumerate() {
+            writeln!(msg, "{}. {}", i + 1, error).unwrap();
+        }
+        NixException::boxed(msg).raise()
+    }
+    let expr = parse.tree().expr().unwrap();
+    let program = IRCompiler::compile(root, filename, code, expr);
+    let runnable = crate::interpreter::into_dynamically_compiled(program, None, 0);
+    ROOT_SCOPE.with(move |s| unsafe { runnable.run(*s, Value::NULL) })
+}
+
 pub fn import(path: PathBuf) -> Value {
     let (path, expr) = match std::fs::read_to_string(&path) {
         Err(e) if e.to_string().contains("Is a directory") => {
@@ -799,18 +829,11 @@ pub fn import(path: PathBuf) -> Value {
     }
     .unwrap();
 
-    let result = {
-        let _tc = measure_parsing_time();
-        rnix::Root::parse(&expr)
-    };
-    let program = IRCompiler::compile(
+    eval_throwing(
         path.parent().unwrap().to_path_buf(),
         path.to_string_lossy().to_string(),
         expr,
-        result.tree().expr().unwrap(),
-    );
-    let compiled = unsafe { COMPILER.compile(program, None).unwrap() };
-    ROOT_SCOPE.with(|root| unsafe { compiled.run(*root, Value::NULL) })
+    )
 }
 
 thread_local! {
