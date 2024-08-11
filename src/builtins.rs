@@ -9,7 +9,7 @@ use std::{
 use regex::Regex;
 
 use crate::{
-    compiler::COMPILER, throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind,
+    throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind,
     ValueMap,
 };
 use crate::{perfstats::measure_parsing_time, LazyValue};

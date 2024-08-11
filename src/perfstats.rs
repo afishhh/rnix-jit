@@ -73,15 +73,15 @@ pub fn print_stats() {
         stats.total_time_spent_evaluating.as_secs_f64() * 1000.
     );
     println!(
-        "total time spent generating IR = {:.2}ms",
+        "time spent generating IR = {:.2}ms",
         stats.time_spent_generating_ir.as_secs_f64() * 1000.
     );
     println!(
-        "total time spent generating JIT executables = {:.2}ms",
+        "time spent generating JIT executables = {:.2}ms",
         stats.time_spent_jitting.as_secs_f64() * 1000.
     );
     println!(
-        "total time spent parsing Nix source = {:.2}ms",
+        "time spent parsing Nix source = {:.2}ms",
         stats.time_spent_parsing.as_secs_f64() * 1000.
     );
 }

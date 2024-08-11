@@ -130,6 +130,7 @@ pub(crate) enum Operation {
     Implication(Program),
     Apply,
     ScopePush(CreateValueMap),
+    ScopeWith(Program),
     // identifier lookup
     Load(String),
     ScopePop,
@@ -452,7 +453,7 @@ impl IRCompiler {
             }
             // TODO:
             Expr::Assert(x) => self.build_program(x.body().unwrap(), program),
-            Expr::Error(_) => todo!(),
+            Expr::Error(_) => unreachable!(),
             Expr::IfElse(x) => {
                 self.build_program(x.condition().unwrap(), program);
                 let if_true = self.create_program(x.body().unwrap());
@@ -576,7 +577,13 @@ impl IRCompiler {
             Expr::Ident(x) => program.operations.push(Operation::Load(
                 x.ident_token().unwrap().green().text().to_string(),
             )),
-            Expr::With(_) => todo!(),
+            Expr::With(x) => {
+                program
+                    .operations
+                    .push(Operation::ScopeWith(self.create_program(x.namespace().unwrap())));
+                self.build_program(x.body().unwrap(), program);
+                program.operations.push(Operation::ScopePop);
+            }
             Expr::HasAttr(x) => {
                 self.build_program(x.expr().unwrap(), program);
                 let attrpath = x.attrpath().unwrap();

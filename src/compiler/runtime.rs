@@ -4,7 +4,7 @@ use std::{
 
 use crate::{
     runnable::Runnable, throw, value::LazyValueImpl, AttrsetValue, CreateValueMap, Function,
-    LazyValue, Scope, UnpackedValue, Value, ValueList, ValueMap,
+    LazyValue, Scope, SourceSpan, UnpackedValue, Value, ValueList, ValueMap,
 };
 
 use super::{CompiledParameter, Executable};
@@ -99,7 +99,15 @@ pub unsafe fn value_map_create(
                 let key = key.to_string();
                 Value::from(lazy_parents[*idx].clone()).lazy_map(move |x| {
                     if let UnpackedValue::Attrset(set) = x.into_evaluated().into_unpacked() {
-                        (*set.get()).get(&key).unwrap().clone()
+                        (*set.get())
+                            .get(&key)
+                            .unwrap_or_else(|| {
+                                throw!(
+                                    "Inherited attribute {key} does not exist in {:?}",
+                                    &*set.get()
+                                )
+                            })
+                            .clone()
                     } else {
                         throw!("Cannot inherit from non attribute set value")
                     }
@@ -135,6 +143,22 @@ pub unsafe extern "C-unwind" fn scope_create(
     create: *const CreateValueMap<Rc<Runnable>>,
 ) -> *mut Scope {
     value_map_create(previous, &*create).1
+}
+
+pub unsafe extern "C-unwind" fn scope_create_with(
+    previous: *mut Scope,
+    namespace: *const Runnable,
+) -> *mut Scope {
+    let namespace_rc = Rc::from_raw(namespace);
+    Scope::with_new_lazy_implicit(previous, move || {
+        match namespace_rc.run(previous, Value::NULL).into_unpacked() {
+            UnpackedValue::Attrset(attrs) => attrs,
+            other => throw!(
+                "with-statement namespace evaluated to a {} instead of an attribute set",
+                other.kind()
+            ),
+        }
+    })
 }
 
 pub unsafe fn attrset_create(

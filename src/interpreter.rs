@@ -3,7 +3,7 @@ use std::{mem::ManuallyDrop, rc::Rc};
 use crate::{
     compiler::{Executable, COMPILER},
     runnable::{Runnable, RunnableVTable},
-    Operation, Parameter, Program, Scope, Value,
+    Parameter, Program, Scope, Value,
 };
 
 struct Interpreted {

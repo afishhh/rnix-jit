@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{compiler::Executable, runnable::Runnable, throw, Scope};
+use crate::{runnable::Runnable, throw, Scope};
 
 pub struct Function {
     pub(crate) runnable: *const Runnable,

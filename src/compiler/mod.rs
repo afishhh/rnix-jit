@@ -525,7 +525,7 @@ impl Compiler {
                         comparison cmovne or Value::not_equal
                     ),
                     Operation::CreateAttrset(create) => {
-                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
+                        let create = closure.intern(create.transpile(&mut |program| _tc.pause(|| self.compile(program, None)))?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, create as *const _ as u64)?;
                         call!(rust attrset_create);
@@ -534,7 +534,7 @@ impl Compiler {
                     }
                     Operation::GetAttrConsume { components, default } => {
                         let default = if let Some(program) = default {
-                            closure.intern(_tc.pause(||self.compile(program, None))?)
+                            closure.intern(_tc.pause(|| self.compile(program, None))?)
                         } else { std::ptr::null() };
 
                         assert!(stack_values > components);
@@ -660,7 +660,7 @@ impl Compiler {
                         stack_values += 1;
                     }
                     Operation::ListAppend(value_program) => {
-                        let raw = closure.intern(_tc.pause(||self.compile(value_program, None))?);
+                        let raw = closure.intern(_tc.pause(|| self.compile(value_program, None))?);
 
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
@@ -682,10 +682,17 @@ impl Compiler {
                         asm.set_label(&mut end)?;
                     }
                     Operation::ScopePush(create) => {
-                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
+                        let create = closure.intern(create.transpile(&mut |program| _tc.pause(|| self.compile(program, None)))?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, create as *const _ as u64)?;
                         call!(rust scope_create);
+                        asm.mov(r15, rax)?;
+                    }
+                    Operation::ScopeWith(program) => {
+                        let namespace = closure.intern(_tc.pause(|| self.compile(program, None))?);
+                        asm.mov(rdi, r15)?;
+                        asm.mov(rsi, namespace as u64)?;
+                        call!(rust scope_create_with);
                         asm.mov(r15, rax)?;
                     }
                     Operation::ScopePop => {
