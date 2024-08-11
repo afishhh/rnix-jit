@@ -231,7 +231,7 @@ impl Compiler {
                             Ok::<(String, _), IcedError>((
                                 name,
                                 default
-                                    .map(|program| _tc.pause(|| self.compile(program, None)))
+                                    .map(|program| self.compile(program, None))
                                     .transpose()?,
                             ))
                         })
@@ -410,7 +410,7 @@ impl Compiler {
                     )
                 }};
                 (boolean $second: expr, shortcircuit(rdi = $value: expr) => $sresult: expr, else(rax) => $nresult: expr) => {emit_asm!(asm, {
-                    { let second = closure.intern(_tc.pause(||self.compile($second, None))?); }
+                    { let second = closure.intern(self.compile($second, None)?); }
 
                     pop rdi;
                     {
@@ -460,7 +460,7 @@ impl Compiler {
                         stack_values += 1;
                     }
                     Operation::PushFunction(param, program) => {
-                        let raw = closure.intern(_tc.pause(||self.compile(program, Some(param)))?);
+                        let raw = closure.intern(self.compile(program, Some(param))?);
                         asm.mov(rdi, raw as u64)?;
                         asm.mov(rsi, r15)?;
                         call!(rust create_function_value);
@@ -525,7 +525,7 @@ impl Compiler {
                         comparison cmovne or Value::not_equal
                     ),
                     Operation::CreateAttrset(create) => {
-                        let create = closure.intern(create.transpile(&mut |program| _tc.pause(|| self.compile(program, None)))?);
+                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, create as *const _ as u64)?;
                         call!(rust attrset_create);
@@ -534,7 +534,7 @@ impl Compiler {
                     }
                     Operation::GetAttrConsume { components, default } => {
                         let default = if let Some(program) = default {
-                            closure.intern(_tc.pause(|| self.compile(program, None))?)
+                            closure.intern(self.compile(program, None)?)
                         } else { std::ptr::null() };
 
                         assert!(stack_values > components);
@@ -660,7 +660,7 @@ impl Compiler {
                         stack_values += 1;
                     }
                     Operation::ListAppend(value_program) => {
-                        let raw = closure.intern(_tc.pause(|| self.compile(value_program, None))?);
+                        let raw = closure.intern(self.compile(value_program, None)?);
 
                         assert!(stack_values >= 1);
                         asm.mov(rdi, qword_ptr(rsp))?;
@@ -682,14 +682,14 @@ impl Compiler {
                         asm.set_label(&mut end)?;
                     }
                     Operation::ScopePush(create) => {
-                        let create = closure.intern(create.transpile(&mut |program| _tc.pause(|| self.compile(program, None)))?);
+                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, create as *const _ as u64)?;
                         call!(rust scope_create);
                         asm.mov(r15, rax)?;
                     }
                     Operation::ScopeWith(program) => {
-                        let namespace = closure.intern(_tc.pause(|| self.compile(program, None))?);
+                        let namespace = closure.intern(self.compile(program, None)?);
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, namespace as u64)?;
                         call!(rust scope_create_with);
@@ -701,8 +701,8 @@ impl Compiler {
                     }
                     Operation::IfElse(if_true, if_false) => {
                         // TODO: inline these into this executable instead
-                        let if_true = closure.intern(_tc.pause(||self.compile(if_true, None))?);
-                        let if_false = closure.intern(_tc.pause(||self.compile(if_false, None))?);
+                        let if_true = closure.intern(self.compile(if_true, None)?);
+                        let if_false = closure.intern(self.compile(if_false, None)?);
 
                         assert!(stack_values >= 1);
                         asm.pop(rsi)?;
