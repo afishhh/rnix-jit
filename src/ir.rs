@@ -36,71 +36,47 @@ pub(crate) enum Parameter {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum AttrsetValue<R = Program> {
+pub(crate) enum AttrsetValue {
     Load,
     Inherit(usize),
-    Childset(CreateValueMap<R>),
-    Program(R),
+    Childset(CreateValueMap),
+    Program(Program),
 }
 
 // FIXME: Is this truly what we want to do?
 //        Not the cleanest thing in the world.
 #[derive(Debug, Clone)]
-pub(crate) struct CreateValueMap<R = Program> {
+pub(crate) struct CreateValueMap {
     pub(crate) rec: bool,
-    pub(crate) parents: Vec<R>,
-    pub(crate) constant: Vec<(String, AttrsetValue<R>)>,
-    pub(crate) dynamic: Vec<(R, AttrsetValue<R>)>,
-}
-
-impl<T> AttrsetValue<T> {
-    fn transpile<U, E>(
-        self,
-        transpiler: &mut impl FnMut(T) -> Result<U, E>,
-    ) -> Result<AttrsetValue<U>, E> {
-        Ok(match self {
-            AttrsetValue::Load => AttrsetValue::<U>::Load,
-            AttrsetValue::Inherit(x) => AttrsetValue::<U>::Inherit(x),
-            AttrsetValue::Childset(create) => AttrsetValue::Childset(create.transpile(transpiler)?),
-            AttrsetValue::Program(t) => AttrsetValue::Program(transpiler(t)?),
-        })
-    }
-}
-
-impl<T> CreateValueMap<T> {
-    pub(crate) fn transpile<U, E>(
-        self,
-        transpiler: &mut impl FnMut(T) -> Result<U, E>,
-    ) -> Result<CreateValueMap<U>, E> {
-        Ok(CreateValueMap::<U> {
-            rec: self.rec,
-            parents: self
-                .parents
-                .into_iter()
-                .map(&mut *transpiler)
-                .collect::<Result<_, E>>()?,
-            constant: self
-                .constant
-                .into_iter()
-                .map(|(key, value)| Ok((key, value.transpile(transpiler)?)))
-                .collect::<Result<_, E>>()?,
-            dynamic: self
-                .dynamic
-                .into_iter()
-                .map(|(key, value)| Ok((transpiler(key)?, value.transpile(transpiler)?)))
-                .collect::<Result<_, E>>()?,
-        })
-    }
+    pub(crate) parents: Vec<Program>,
+    pub(crate) constant: Vec<(String, AttrsetValue)>,
+    pub(crate) dynamic: Vec<(Program, AttrsetValue)>,
 }
 
 // TODO: Make Programs live in an Arena
 
+// TODO: Adding an accumulator to the virtual machine would simplify things
 #[derive(Debug, Clone)]
 pub(crate) enum Operation {
     Push(Value),
     // This is different from Push because this also sets the parent scope of the function
     PushFunction(Parameter, Program),
-    CreateAttrset(CreateValueMap),
+
+    MapBegin {
+        parents: Vec<Program>,
+        rec: bool,
+    },
+    ConstantAttrPop(String),
+    ConstantAttrLoad(String),
+    ConstantAttrLazy(String, Program),
+    ConstantAttrInherit(String, usize),
+    DynamicAttrPop,
+    DynamicAttrLazy(Program),
+
+    // Passing parents here again is slightly unclean
+    PushAttrset {
+        parents: usize,
+    },
     GetAttrConsume {
         components: usize,
         default: Option<Program>,
@@ -129,11 +105,13 @@ pub(crate) enum Operation {
     NotEqual,
     Implication(Program),
     Apply,
-    ScopePush(CreateValueMap),
+    ScopeEnter {
+        parents: usize,
+    },
     ScopeWith(Program),
     // identifier lookup
     Load(String),
-    ScopePop,
+    ScopeLeave,
     IfElse(Program, Program),
     Invert,
     Negate,
@@ -334,6 +312,59 @@ impl AttrsetBuilder {
     }
 }
 
+impl CreateValueMap {
+    fn emit_program(self, program: &mut Program) {
+        program.operations.push(Operation::MapBegin {
+            parents: self.parents,
+            rec: self.rec,
+        });
+
+        for (key, value) in self.constant {
+            match value {
+                AttrsetValue::Load => {
+                    program.operations.push(Operation::ConstantAttrLoad(key));
+                }
+                AttrsetValue::Inherit(i) => {
+                    program
+                        .operations
+                        .push(Operation::ConstantAttrInherit(key, i));
+                }
+                AttrsetValue::Childset(x) => {
+                    let parents = x.parents.len();
+                    x.emit_program(program);
+                    program.operations.push(Operation::PushAttrset { parents });
+                    program.operations.push(Operation::ConstantAttrPop(key));
+                }
+                AttrsetValue::Program(p) => {
+                    program.operations.push(Operation::ConstantAttrLazy(key, p));
+                }
+            }
+        }
+
+        for (key, value) in self.dynamic {
+            program.operations.extend(key.operations);
+            match value {
+                AttrsetValue::Load |  AttrsetValue::Inherit(_) => {
+                    panic!("dynamic attributes not allowed in inherit");
+                }
+                AttrsetValue::Childset(x) => {
+                    let parents = x.parents.len();
+                    x.emit_program(program);
+                    program.operations.push(Operation::PushAttrset { parents });
+                    program.operations.push(Operation::DynamicAttrPop);
+                }
+                AttrsetValue::Program(p) => {
+                    program.operations.push(Operation::DynamicAttrLazy(p));
+                }
+            }
+        }
+
+        if self.rec {
+            program.operations.push(Operation::ScopeLeave);
+        }
+    }
+}
+
 impl IRCompiler {
     fn create_program(&self, expr: Expr) -> Program {
         let mut program = Program { operations: vec![] };
@@ -510,11 +541,14 @@ impl IRCompiler {
             }
             Expr::LegacyLet(_) => todo!(),
             Expr::LetIn(x) => {
-                let attrset =
+                let map =
                     AttrsetBuilder::build_whole(self, true, x.inherits(), x.attrpath_values());
-                program.operations.push(Operation::ScopePush(attrset));
+                let parents = map.parents.len();
+                map.emit_program(program);
+
+                program.operations.push(Operation::ScopeEnter { parents });
                 self.build_program(x.body().unwrap(), program);
-                program.operations.push(Operation::ScopePop);
+                program.operations.push(Operation::ScopeLeave);
             }
             Expr::List(x) => {
                 program.operations.push(Operation::PushList);
@@ -559,13 +593,15 @@ impl IRCompiler {
             }
             Expr::Paren(x) => self.build_program(x.expr().unwrap(), program),
             Expr::AttrSet(x) => {
-                let attrset = AttrsetBuilder::build_whole(
+                let map = AttrsetBuilder::build_whole(
                     self,
                     x.rec_token().is_some(),
                     x.inherits(),
                     x.attrpath_values(),
                 );
-                program.operations.push(Operation::CreateAttrset(attrset));
+                let parents = map.parents.len();
+                map.emit_program(program);
+                program.operations.push(Operation::PushAttrset { parents });
             }
             Expr::UnaryOp(x) => {
                 self.build_program(x.expr().unwrap(), program);
@@ -578,11 +614,11 @@ impl IRCompiler {
                 x.ident_token().unwrap().green().text().to_string(),
             )),
             Expr::With(x) => {
-                program
-                    .operations
-                    .push(Operation::ScopeWith(self.create_program(x.namespace().unwrap())));
+                program.operations.push(Operation::ScopeWith(
+                    self.create_program(x.namespace().unwrap()),
+                ));
                 self.build_program(x.body().unwrap(), program);
-                program.operations.push(Operation::ScopePop);
+                program.operations.push(Operation::ScopeLeave);
             }
             Expr::HasAttr(x) => {
                 self.build_program(x.expr().unwrap(), program);

@@ -817,7 +817,7 @@ macro_rules! value {
     (null) => { $crate::value::Value::NULL };
     ($expr: expr) => { $crate::value::Value::from($expr) };
 
-    (@key [$key: expr]) => { $key };
+    (@key [$key: expr]) => { String::from($key) };
     (@key $key: ident) => { stringify!($key).to_string() };
 
     (@listcount $current: expr; $value: expr$(, $($rest: tt)*)?) => { $crate::value!(@listcount $current + 1; $($($rest)*)?) };
@@ -857,7 +857,7 @@ fn test_value_macro() {
     assert_eq!(
         value!({
             hello = 10;
-            ["computed key".to_string()] = [124, "1245"];
+            ["computed key"] = [124, "1245"];
             [9.to_string()] = {
                 even = false;
                 odd = true;

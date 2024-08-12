@@ -112,3 +112,52 @@ compare_file_eval!(test12, "test12.nix", {
     invert1 = false;
     invert2 = true;
 });
+
+// This tests every current availble opcode for map construction
+compare_file_eval!(
+    attribute_set_construction,
+    "attribute_set_construction.nix",
+    {
+        hello = {
+            a = {
+                b = {
+                    c = 1;
+                    d = 50;
+                    f = 30;
+                };
+                d = {
+                    f = 20;
+                };
+            };
+        };
+        ["hello 20"] = {
+            aaa = {
+                ["x86_64-linux"] = {
+                    aa = {
+                        value = 20;
+                    };
+                };
+            };
+        };
+        ["hello 40"] = 2;
+        ["inherit"] = {
+            a = {
+                c = 100;
+            };
+            c = 100;
+        };
+        one = {
+            two = [1, 2];
+        };
+        rectest = {
+            x = 1;
+            y = 2;
+            z = 3;
+        };
+        rectest2 = {
+            x = 1;
+            y = 2;
+            z = 3;
+        };
+    }
+);

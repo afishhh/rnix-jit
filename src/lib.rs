@@ -44,7 +44,7 @@ impl ImplicitScope {
                     let ImplicitScopeStorage::Evaluated(x) = &*self.storage.get() else {
                         std::hint::unreachable_unchecked();
                     };
-                    &*x
+                    x
                 }
             }
         }
@@ -53,8 +53,8 @@ impl ImplicitScope {
 
 enum ScopeStorage {
     // Used for recursive attribute sets
-    Attrset,
-    Scope(ValueMap),
+    Rc,
+    Owned(ValueMap),
     Unowned,
 }
 
@@ -73,12 +73,12 @@ impl Scope {
         unsafe {
             let scope_ptr = Box::leak(Box::new(Scope {
                 values: std::ptr::null(),
-                storage: ScopeStorage::Scope(map),
+                storage: ScopeStorage::Owned(map),
                 previous,
                 implicit_scope: previous.as_ref().and_then(|x| x.implicit_scope.clone()),
             })) as *mut Scope;
             (*scope_ptr).values =
-                (scope_ptr as *const u8).add(offset_of!(Scope, storage.Scope.0)) as *const _;
+                (scope_ptr as *const u8).add(offset_of!(Scope, storage.Owned.0)) as *const _;
             scope_ptr
         }
     }
@@ -88,7 +88,7 @@ impl Scope {
             Box::leak(Box::new(Scope {
                 values: (*Rc::<UnsafeCell<ValueMap>>::into_raw(map)).get(),
                 previous,
-                storage: ScopeStorage::Attrset,
+                storage: ScopeStorage::Rc,
                 implicit_scope: previous.as_ref().and_then(|x| x.implicit_scope.clone()),
             }))
         }
@@ -153,7 +153,7 @@ impl Scope {
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        if matches!(self.storage, ScopeStorage::Attrset) {
+        if matches!(self.storage, ScopeStorage::Rc) {
             unsafe { Rc::decrement_strong_count(self.values) }
         }
     }

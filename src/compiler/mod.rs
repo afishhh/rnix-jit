@@ -1,17 +1,12 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, LinkedList},
     ffi::c_void,
     mem::offset_of,
     rc::{Rc, Weak},
 };
 
 use crate::{
-    dwarf::*,
-    exception::*,
-    perfstats::measure_jit_codegen_time,
-    runnable::{Runnable, RunnableVTable},
-    unwind::*,
-    CreateValueMap, Function, Operation, Parameter, Program, Scope, SourceSpan, Value, ValueKind,
+    dwarf::*, exception::*, perfstats::measure_jit_codegen_time, runnable::{Runnable, RunnableVTable}, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan, UnpackedValue, Value, ValueKind
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -31,10 +26,8 @@ pub enum CompiledParameter {
 
 #[derive(Debug)]
 pub struct ExecutableClosure {
-    _strings: Vec<String>,
+    _strings: LinkedList<String>,
     _runnables: Vec<Rc<Runnable<Executable>>>,
-    // TODO: properly jit compile this instead
-    _create_value_map: Vec<Box<CreateValueMap<Rc<Runnable<Executable>>>>>,
     _values: Vec<Value>,
     parameter: Option<Box<CompiledParameter>>,
 }
@@ -42,9 +35,8 @@ pub struct ExecutableClosure {
 impl ExecutableClosure {
     pub fn new(parameter: Option<Box<CompiledParameter>>) -> ExecutableClosure {
         Self {
-            _strings: Vec::new(),
+            _strings: LinkedList::new(),
             _runnables: Vec::new(),
-            _create_value_map: Vec::new(),
             _values: Vec::new(),
             parameter,
         }
@@ -57,13 +49,10 @@ trait ExecutableInternable: Sized {
 }
 
 impl ExecutableInternable for String {
-    // NOTE: This lifetime is not 'static, it has just been erased
-    //       Doing this "properly" is not worth it at all.
-    type Output = &'static str;
+    type Output = *const String;
     fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
-        let erased = unsafe { &*(self.as_str() as *const str) };
-        closure._strings.push(self);
-        erased
+        closure._strings.push_back(self);
+        unsafe { closure._strings.back().unwrap_unchecked() as *const _ }
     }
 }
 
@@ -82,17 +71,6 @@ impl ExecutableInternable for Rc<Runnable<Executable>> {
     fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
         let ptr = Rc::as_ptr(&self);
         closure._runnables.push(self);
-        ptr
-    }
-}
-
-impl ExecutableInternable for CreateValueMap<Rc<Runnable<Executable>>> {
-    type Output = *const CreateValueMap<Rc<Runnable<Executable>>>;
-
-    fn intern(self, closure: &mut ExecutableClosure) -> Self::Output {
-        let b = Box::new(self);
-        let ptr = &*b as *const _;
-        closure._create_value_map.push(b);
         ptr
     }
 }
@@ -467,6 +445,108 @@ impl Compiler {
                         asm.push(rax)?;
                         stack_values += 1;
                     }
+
+                    Operation::MapBegin { parents, rec } => {
+                        emit_asm!(asm, {
+                            { call!(rust map_create); }
+                            mov r12, rax;
+                        });
+
+                        if rec { emit_asm!(asm, {
+                            mov rdi, rax;
+                            mov rsi, r15;
+                            { call!(rust map_create_recursive_scope); }
+                            mov r15, rax;
+                        }); }
+
+                        for program in parents.into_iter().rev() {
+                            let runnable = closure.intern(self.compile(program, None)?);
+                            emit_asm!(asm, {
+                                mov rdi, r15;
+                                mov rsi, runnable as u64;
+                                { call!(rust create_lazy_value); } 
+                                push rax;
+                                { stack_values += 1; }
+                            });
+                        }
+
+                        emit_asm!(asm, {
+                            push r12;
+                            { stack_values += 1; }
+                        })
+                    },
+
+                    Operation::ConstantAttrPop(name) => {
+                        let name = closure.intern(name);
+                        emit_asm!(asm, {
+                            pop rdx;
+                            { stack_values -= 1; }
+                            mov rdi, qword_ptr(rsp);
+                            mov rsi, name as *const _ as u64;
+                            { call!(rust map_insert_constant); }
+                        });
+                    },
+                    Operation::ConstantAttrLazy(name, value) => {
+                        let name = closure.intern(name);
+                        let runnable = closure.intern(self.compile(value, None)?);
+                        emit_asm!(asm, {
+                            mov rdi, r15;
+                            mov rsi, runnable as u64;
+                            { call!(rust create_lazy_value); } 
+                            mov rdi, qword_ptr(rsp);
+                            mov rsi, name as *const _ as u64;
+                            mov rdx, rax;
+                            { call!(rust map_insert_constant); }
+                        });
+                    },
+                    Operation::ConstantAttrLoad(name) => {
+                        let name = closure.intern(name);
+                        emit_asm!(asm, {
+                            mov rdi, r15;
+                            mov rsi, name as *const _ as u64;
+                            { call!(rust scope_lookup); } 
+                            mov rdi, qword_ptr(rsp);
+                            mov rsi, name as *const _ as u64;
+                            mov rdx, rax;
+                            { call!(rust map_insert_constant); }
+                        });
+                    },
+                    Operation::ConstantAttrInherit(name, index) => {
+                        let rc = Rc::new(name);
+                        let string_ptr = Rc::as_ptr(&rc);
+                        let name = closure.intern(UnpackedValue::String(rc).pack());
+                        emit_asm!(asm, {
+                            mov rdi, qword_ptr(rsp + 8 * (index + 1));
+                            mov rsi, name.into_raw();
+                            { call!(rust create_lazy_attrset_access); } 
+                            mov rdi, qword_ptr(rsp);
+                            mov rsi, string_ptr as *const _ as u64;
+                            mov rdx, rax;
+                            { call!(rust map_insert_constant); }
+                        });
+                    },
+
+                    Operation::DynamicAttrPop => emit_asm!(asm, {
+                        pop rdx;
+                        pop rsi;
+                        { stack_values -= 2; }
+                        mov rdi, qword_ptr(rsp);
+                        { call!(rust map_insert_dynamic); }
+                    }),
+                    Operation::DynamicAttrLazy(value) => {
+                        let runnable = closure.intern(self.compile(value, None)?);
+                        emit_asm!(asm, {
+                            mov rdi, r15;
+                            mov rsi, runnable as u64;
+                            { call!(rust create_lazy_value); } 
+                            pop rsi;
+                            { stack_values -= 1; }
+                            mov rdi, qword_ptr(rsp);
+                            mov rdx, rax;
+                            { call!(rust map_insert_dynamic); }
+                        });
+                    },
+
                     Operation::Add => impl_binary_operator!(
                         int => retag(Integer) { asm.add(edi, esi)?; rdi },
                         fallback = Value::add
@@ -524,11 +604,11 @@ impl Compiler {
                     Operation::NotEqual => impl_binary_operator!(
                         comparison cmovne or Value::not_equal
                     ),
-                    Operation::CreateAttrset(create) => {
-                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
-                        asm.mov(rdi, r15)?;
-                        asm.mov(rsi, create as *const _ as u64)?;
-                        call!(rust attrset_create);
+                    Operation::PushAttrset { parents } => {
+                        asm.pop(rdi)?;
+                        asm.add(rsp, (parents * 8) as i32)?;
+                        stack_values -= 1 + parents;
+                        call!(rust map_into_attrset);
                         asm.push(rax)?;
                         stack_values += 1;
                     }
@@ -648,8 +728,7 @@ impl Compiler {
                     Operation::Load(name) => {
                         let name = closure.intern(name);
                         asm.mov(rdi, r15)?;
-                        asm.mov(rsi, name.as_ptr() as u64)?;
-                        asm.mov(rdx, name.len() as u64)?;
+                        asm.mov(rsi, name as *const _ as u64)?;
                         call!(rust scope_lookup);
                         asm.push(rax)?;
                         stack_values += 1;
@@ -681,11 +760,12 @@ impl Compiler {
 
                         asm.set_label(&mut end)?;
                     }
-                    Operation::ScopePush(create) => {
-                        let create = closure.intern(create.transpile(&mut |program| self.compile(program, None))?);
-                        asm.mov(rdi, r15)?;
-                        asm.mov(rsi, create as *const _ as u64)?;
-                        call!(rust scope_create);
+                    Operation::ScopeEnter { parents } => {
+                        asm.pop(rdi)?;
+                        asm.add(rsp, (parents * 8) as i32)?;
+                        stack_values -= 1 + parents;
+                        asm.mov(rsi, r15)?;
+                        call!(rust map_into_scope);
                         asm.mov(r15, rax)?;
                     }
                     Operation::ScopeWith(program) => {
@@ -695,7 +775,7 @@ impl Compiler {
                         call!(rust scope_create_with);
                         asm.mov(r15, rax)?;
                     }
-                    Operation::ScopePop => {
+                    Operation::ScopeLeave => {
                         // FIXME: make scopes rc or smth
                         asm.mov(r15, qword_ptr(r15 + offset_of!(Scope, previous)))?;
                     }
