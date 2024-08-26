@@ -8,11 +8,8 @@ use std::{
 
 use regex::Regex;
 
-use crate::{
-    throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind,
-    ValueMap,
-};
 use crate::{perfstats::measure_parsing_time, LazyValue};
+use crate::{throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind, ValueMap};
 
 fn human_valuekind(kind: ValueKind) -> &'static str {
     match kind {
@@ -815,7 +812,17 @@ pub(crate) fn eval_throwing(root: PathBuf, filename: String, code: String) -> Va
     }
     let expr = parse.tree().expr().unwrap();
     let program = IRCompiler::compile(root, filename, code, expr);
-    let runnable = crate::interpreter::into_dynamically_compiled(program, None, 0);
+
+    let mode = std::env::var("RNIX_JIT_MODE").unwrap_or_default();
+    let threshold = match mode.as_str() {
+        "INTERPRET" => usize::MAX,
+        "HYBRID" => 10,
+        h if h.starts_with("HYBRID=") => h.strip_prefix("HYBRID=").unwrap().parse().unwrap_or(10),
+        "COMPILE" => 0,
+        _ => 10
+    };
+
+    let runnable = crate::interpreter::into_dynamically_compiled(program, None, threshold);
     ROOT_SCOPE.with(move |s| unsafe { runnable.run(*s, Value::NULL) })
 }
 

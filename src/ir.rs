@@ -29,7 +29,7 @@ pub struct SourceSpan {
 pub(crate) enum Parameter {
     Ident(String),
     Pattern {
-        entries: Vec<(String, Option<Program>)>,
+        entries: Vec<(String, Option<Rc<Program>>)>,
         binding: Option<String>,
         ignore_unmatched: bool,
     },
@@ -40,7 +40,7 @@ pub(crate) enum AttrsetValue {
     Load,
     Inherit(usize),
     Childset(CreateValueMap),
-    Program(Program),
+    Program(Rc<Program>),
 }
 
 // FIXME: Is this truly what we want to do?
@@ -48,7 +48,7 @@ pub(crate) enum AttrsetValue {
 #[derive(Debug, Clone)]
 pub(crate) struct CreateValueMap {
     pub(crate) rec: bool,
-    pub(crate) parents: Vec<Program>,
+    pub(crate) parents: Vec<Rc<Program>>,
     pub(crate) constant: Vec<(String, AttrsetValue)>,
     pub(crate) dynamic: Vec<(Program, AttrsetValue)>,
 }
@@ -60,18 +60,18 @@ pub(crate) struct CreateValueMap {
 pub(crate) enum Operation {
     Push(Value),
     // This is different from Push because this also sets the parent scope of the function
-    PushFunction(Parameter, Program),
+    PushFunction(Parameter, Rc<Program>),
 
     MapBegin {
-        parents: Vec<Program>,
+        parents: Vec<Rc<Program>>,
         rec: bool,
     },
     ConstantAttrPop(String),
     ConstantAttrLoad(String),
-    ConstantAttrLazy(String, Program),
-    ConstantAttrInherit(String, usize),
+    ConstantAttrLazy(String, Rc<Program>),
+    ConstantAttrInherit(Rc<String>, usize),
     DynamicAttrPop,
-    DynamicAttrLazy(Program),
+    DynamicAttrLazy(Rc<Program>),
 
     // Passing parents here again is slightly unclean
     PushAttrset {
@@ -79,11 +79,11 @@ pub(crate) enum Operation {
     },
     GetAttrConsume {
         components: usize,
-        default: Option<Program>,
+        default: Option<Rc<Program>>,
     },
     HasAttrpath(usize),
     PushList,
-    ListAppend(Program),
+    ListAppend(Rc<Program>),
     StringCloneToMut,
     // TODO: Make construction Operations like StringAppend, SetAttrpath, InheritAttrs etc.
     //       unchecked at runtime (with optional checking for debugging?).
@@ -95,24 +95,24 @@ pub(crate) enum Operation {
     Sub,
     Mul,
     Div,
-    And(Program),
-    Or(Program),
+    And(Rc<Program>),
+    Or(Rc<Program>),
     Less,
     LessOrEqual,
     MoreOrEqual,
     More,
     Equal,
     NotEqual,
-    Implication(Program),
+    Implication(Rc<Program>),
     Apply,
     ScopeEnter {
         parents: usize,
     },
-    ScopeWith(Program),
+    ScopeWith(Rc<Program>),
     // identifier lookup
     Load(String),
     ScopeLeave,
-    IfElse(Program, Program),
+    IfElse(Rc<Program>, Rc<Program>),
     Invert,
     Negate,
     SourceSpanPush(SourceSpan),
@@ -127,6 +127,11 @@ pub struct Program {
 impl Program {
     fn new() -> Self {
         Self { operations: vec![] }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, operation: Operation) {
+        self.operations.push(operation);
     }
 }
 
@@ -192,7 +197,7 @@ impl AttrsetBuilder {
             self.add_attr(compiler, attr, value);
         }
         if let Some(source) = from {
-            self.create.parents.push(source);
+            self.create.parents.push(Rc::new(source));
         }
     }
 
@@ -295,7 +300,7 @@ impl AttrsetBuilder {
             let source = inherit
                 .from()
                 .and_then(|f| f.expr())
-                .map(|source| compiler.create_program(source));
+                .map(|source| compiler.create_owned_program(source));
             self.inherit(compiler, source, inherit.attrs());
         }
         for attrvalue in values {
@@ -327,7 +332,7 @@ impl CreateValueMap {
                 AttrsetValue::Inherit(i) => {
                     program
                         .operations
-                        .push(Operation::ConstantAttrInherit(key, i));
+                        .push(Operation::ConstantAttrInherit(Rc::new(key), i));
                 }
                 AttrsetValue::Childset(x) => {
                     let parents = x.parents.len();
@@ -344,7 +349,7 @@ impl CreateValueMap {
         for (key, value) in self.dynamic {
             program.operations.extend(key.operations);
             match value {
-                AttrsetValue::Load |  AttrsetValue::Inherit(_) => {
+                AttrsetValue::Load | AttrsetValue::Inherit(_) => {
                     panic!("dynamic attributes not allowed in inherit");
                 }
                 AttrsetValue::Childset(x) => {
@@ -366,10 +371,14 @@ impl CreateValueMap {
 }
 
 impl IRCompiler {
-    fn create_program(&self, expr: Expr) -> Program {
+    fn create_owned_program(&self, expr: Expr) -> Program {
         let mut program = Program { operations: vec![] };
         self.build_program(expr, &mut program);
         program
+    }
+
+    fn create_program(&self, expr: Expr) -> Rc<Program> {
+        Rc::new(self.create_owned_program(expr))
     }
 
     fn build_attrpath(&self, attrpath: Attrpath, program: &mut Program) -> usize {
@@ -464,7 +473,7 @@ impl IRCompiler {
             Attr::Str(string) => self.create_maybe_const_string(string.normalized_parts()),
             Attr::Dynamic(dynamic) => match dynamic.expr().unwrap() {
                 Expr::Str(string) => self.create_maybe_const_string(string.normalized_parts()),
-                expr => Err(self.create_program(expr)),
+                expr => Err(self.create_owned_program(expr)),
             },
         }
     }
@@ -636,7 +645,7 @@ impl IRCompiler {
         filename: String,
         file_content: String,
         expression: Expr,
-    ) -> Program {
+    ) -> Rc<Program> {
         let _tc = measure_ir_generation_time();
         IRCompiler {
             working_directory,

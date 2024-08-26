@@ -108,6 +108,20 @@ impl LazyValue {
         ))))
     }
 
+    pub fn new_attribute_access(mut attrset: Value, mut key: Value) -> LazyValue {
+        LazyValue::from_closure(move || {
+            let key = String::unpack_ref_from_or_throw(key.evaluate_mut());
+            let map = ValueMap::unpack_ref_from_or_throw(attrset.evaluate_mut());
+
+            unsafe {
+                (*map.get())
+                    .get(&**key)
+                    .unwrap_or_else(|| throw!("Inherited key {key} does not exist in {attrset}"))
+                    .clone()
+            }
+        })
+    }
+
     pub fn evaluate(&self) -> &Value {
         unsafe { &mut *self.0.get() }.evaluate()
     }
@@ -133,23 +147,6 @@ pub enum UnpackedValue {
     Path(Rc<PathBuf>),
     Lazy(LazyValue),
     Null,
-}
-
-impl Display for ValueKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValueKind::Integer => f.write_str("integer"),
-            ValueKind::Double => f.write_str("float"),
-            ValueKind::Bool => f.write_str("boolean"),
-            ValueKind::String => f.write_str("string"),
-            ValueKind::Path => f.write_str("path"),
-            ValueKind::List => f.write_str("list"),
-            ValueKind::Attrset => f.write_str("set"),
-            ValueKind::Lazy => f.write_str("<lazy>"),
-            ValueKind::Null => f.write_str("null"),
-            Self::Function => f.write_str("function"),
-        }
-    }
 }
 
 impl From<i32> for UnpackedValue {
@@ -473,9 +470,6 @@ compile_error!("QUIET_NAN_BITS and SIGNALLING_NAN_BITS not defined for this arch
 pub(crate) const VALUE_TAG_MASK: u64 =
     0b1111111111111111000000000000000000000000000000000000000000000000;
 pub(crate) const VALUE_PAYLOAD_MASK: u64 = !VALUE_TAG_MASK;
-// A quiet NaN on *most* platforms.
-pub(crate) const CANONICAL_NAN_BITS: u64 =
-    0b0111111111110000000000000000000000000000000000000000000000000000;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +497,23 @@ impl ValueKind {
     #[inline(always)]
     pub(crate) const fn as_shifted(self) -> u16 {
         (self.as_nan_bits() >> 48) as u16
+    }
+}
+
+impl Display for ValueKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ValueKind::Attrset => "an attribute set",
+            ValueKind::Function => "a function",
+            ValueKind::Integer => "an integer",
+            ValueKind::Double => "a floating point number",
+            ValueKind::String => "a string",
+            ValueKind::Path => "a path",
+            ValueKind::List => "a list",
+            ValueKind::Bool => "a boolean",
+            ValueKind::Lazy => "a lazy value",
+            ValueKind::Null => "null",
+        })
     }
 }
 
@@ -567,61 +578,6 @@ impl Value {
         self.0 & VALUE_TAG_MASK == kind.as_nan_bits()
     }
 
-    pub fn unpack(&self) -> UnpackedValue {
-        macro_rules! unpack_ptr {
-            ($kind: ident) => {
-                UnpackedValue::$kind(unsafe {
-                    let raw = self.as_pointer_bits() as *mut _;
-                    Rc::increment_strong_count(raw);
-                    Rc::from_raw(raw)
-                })
-            };
-        }
-        match self.kind() {
-            ValueKind::Integer => UnpackedValue::Integer(unsafe {
-                std::mem::transmute((self.0 & VALUE_PAYLOAD_MASK) as u32)
-            }),
-            ValueKind::Double => UnpackedValue::Double(f64::from_bits(self.0)),
-            ValueKind::String => unpack_ptr!(String),
-            ValueKind::Path => unpack_ptr!(Path),
-            ValueKind::List => unpack_ptr!(List),
-            ValueKind::Attrset => unpack_ptr!(Attrset),
-            ValueKind::Function => unpack_ptr!(Function),
-            // FIXME: this pointer may not be in x86_64 canonical form
-            ValueKind::Lazy => unsafe {
-                let raw = self.as_pointer_bits() as *mut _;
-                Rc::increment_strong_count(raw);
-                UnpackedValue::Lazy(LazyValue(Rc::from_raw(raw)))
-            },
-            ValueKind::Bool => UnpackedValue::Bool(self.0 == Value::TRUE.0),
-            ValueKind::Null => UnpackedValue::Null,
-        }
-    }
-
-    pub(crate) fn into_unpacked(self) -> UnpackedValue {
-        macro_rules! unpack_ptr {
-            ($kind: ident) => {
-                UnpackedValue::$kind(unsafe { Rc::from_raw(self.as_pointer_bits() as *mut _) })
-            };
-        }
-        match self.kind() {
-            ValueKind::Integer => UnpackedValue::Integer(unsafe {
-                std::mem::transmute((self.0 & VALUE_PAYLOAD_MASK) as u32)
-            }),
-            ValueKind::Double => UnpackedValue::Double(f64::from_bits(self.0)),
-            ValueKind::Bool => UnpackedValue::Bool(self.0 == Value::TRUE.0),
-            ValueKind::String => unpack_ptr!(String),
-            ValueKind::Path => unpack_ptr!(Path),
-            ValueKind::List => unpack_ptr!(List),
-            ValueKind::Attrset => unpack_ptr!(Attrset),
-            ValueKind::Function => unpack_ptr!(Function),
-            ValueKind::Lazy => unsafe {
-                UnpackedValue::Lazy(LazyValue(Rc::from_raw(self.as_pointer_bits() as *const _)))
-            },
-            ValueKind::Null => UnpackedValue::Null,
-        }
-    }
-
     unsafe fn increase_refcount(&self) {
         macro_rules! incref {
             ($x: expr) => {
@@ -683,6 +639,34 @@ impl Value {
 
     pub fn is_false(&self) -> bool {
         self.0 == Self::FALSE.0
+    }
+
+    pub fn get_attribute(&self, key: &str) -> &Value {
+        let set = self.unpack_typed_ref_or_throw::<ValueMap>();
+        unsafe {
+            (*set.get())
+                .get(key)
+                .unwrap_or_else(|| throw!("{self} does not contain attribute {key}"))
+        }
+    }
+
+    pub(crate) fn make_mut_string(self) -> Value {
+        macro_rules! clonerc {
+            ($x: expr) => {
+                if Rc::strong_count(&$x) > 1 {
+                    Rc::new((*$x).clone())
+                } else {
+                    $x
+                }
+            };
+        }
+        match self.into_unpacked() {
+            UnpackedValue::String(x) => UnpackedValue::String(clonerc!(x)),
+            UnpackedValue::Path(x) => UnpackedValue::new_string(x.to_str().unwrap().to_string()),
+            UnpackedValue::Lazy(x) => return x.evaluate().clone().make_mut_string(),
+            other => other,
+        }
+        .pack()
     }
 }
 
@@ -795,6 +779,169 @@ impl Display for Value {
 impl Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.unpack())
+    }
+}
+
+macro_rules! def_unpack_variant {
+    ($extract: ident ($type: ty) -> $output: ty, $unpack: ident, $unpack_or_throw: ident) => {
+        unsafe fn $extract(value: $type) -> $output;
+
+        fn $unpack(value: $type) -> Option<$output> {
+            if value.kind() == Self::KIND {
+                unsafe { Some(Self::$extract(value)) }
+            } else {
+                None
+            }
+        }
+
+        fn $unpack_or_throw(value: $type) -> $output {
+            let kind = value.kind();
+            Self::$unpack(value)
+                .unwrap_or_else(|| throw!("value is {kind} while {} was expected", Self::KIND))
+        }
+    };
+}
+
+pub(crate) trait ValueUnpackable: Sized {
+    type Output;
+    type OutputRef<'a>;
+    const KIND: ValueKind;
+
+    def_unpack_variant!(extract_from(Value) -> Self::Output, unpack_from, unpack_from_or_throw);
+    def_unpack_variant!(extract_from_ref(&Value) -> Self::Output, unpack_from_ref, unpack_from_ref_or_throw);
+    def_unpack_variant!(extract_ref_from(&Value) -> Self::OutputRef<'_>, unpack_ref_from, unpack_ref_from_or_throw);
+}
+
+macro_rules! unpackable_for_rc {
+    ($type: ty, $inner: ty, $kind: expr) => {
+        impl ValueUnpackable for $type {
+            type Output = Rc<$inner>;
+            type OutputRef<'a> = &'a $inner;
+            const KIND: ValueKind = $kind;
+
+            unsafe fn extract_from(value: Value) -> Self::Output {
+                Rc::from_raw(value.as_pointer_bits() as *const $inner)
+            }
+
+            unsafe fn extract_from_ref(value: &Value) -> Self::Output {
+                Rc::from_raw({
+                    let ptr = value.as_pointer_bits() as *const $inner;
+                    Rc::increment_strong_count(ptr);
+                    ptr
+                })
+            }
+
+            unsafe fn extract_ref_from(value: &Value) -> Self::OutputRef<'_> {
+                &*(value.as_pointer_bits() as *const $inner)
+            }
+        }
+    };
+}
+
+macro_rules! unpackable_for_copy {
+    ($type: ty, $kind: expr, |$param: ident| $extractor: expr) => {
+        impl ValueUnpackable for $type {
+            type Output = $type;
+            type OutputRef<'a> = $type;
+            const KIND: ValueKind = $kind;
+
+            unsafe fn extract_from(value: Value) -> Self::Output {
+                Self::extract_from_ref(&value)
+            }
+
+            unsafe fn extract_from_ref($param: &Value) -> Self::Output {
+                $extractor
+            }
+
+            unsafe fn extract_ref_from($param: &Value) -> Self::OutputRef<'_> {
+                $extractor
+            }
+        }
+    };
+}
+
+unpackable_for_rc!(String, String, ValueKind::String);
+unpackable_for_rc!(ValueList, UnsafeCell<ValueList>, ValueKind::List);
+unpackable_for_rc!(ValueMap, UnsafeCell<ValueMap>, ValueKind::Attrset);
+unpackable_for_rc!(Function, Function, ValueKind::Function);
+unpackable_for_rc!(PathBuf, PathBuf, ValueKind::Path);
+unpackable_for_copy!(f64, ValueKind::Double, |value| f64::from_bits(value.0));
+unpackable_for_copy!(i32, ValueKind::Integer, |value| std::mem::transmute(
+    (value.0 & VALUE_PAYLOAD_MASK) as u32
+));
+unpackable_for_copy!(bool, ValueKind::Bool, |value| value.0 == Value::TRUE.0);
+
+impl ValueUnpackable for LazyValue {
+    type Output = LazyValue;
+    type OutputRef<'a> = &'a UnsafeCell<LazyValueImpl>;
+    const KIND: ValueKind = ValueKind::Lazy;
+
+    unsafe fn extract_from(value: Value) -> Self::Output {
+        LazyValue(Rc::from_raw(value.as_pointer_bits() as *const _))
+    }
+
+    unsafe fn extract_from_ref(value: &Value) -> Self::Output {
+        LazyValue(Rc::from_raw({
+            let ptr = value.as_pointer_bits() as *const _;
+            Rc::increment_strong_count(ptr);
+            ptr
+        }))
+    }
+
+    unsafe fn extract_ref_from(value: &Value) -> Self::OutputRef<'_> {
+        &*(value.as_pointer_bits() as *const _)
+    }
+}
+
+macro_rules! impl_value_unpacks {
+    (@mkone $name: ident ($param: ty) $extractor: ident {$($unpackables: ty => $variant: ident),* $(,)?}) => {
+        pub fn $name(self: $param) -> UnpackedValue {
+            match self.kind() {
+                $(<$unpackables as ValueUnpackable>::KIND => unsafe {
+                    UnpackedValue::$variant(<$unpackables as ValueUnpackable>::$extractor(self))
+                },)*
+                // FIXME: this pointer may not be in x86_64 canonical form
+                ValueKind::Lazy => unsafe {
+                    let raw = self.as_pointer_bits() as *mut _;
+                    Rc::increment_strong_count(raw);
+                    UnpackedValue::Lazy(LazyValue(Rc::from_raw(raw)))
+                },
+                ValueKind::Null => UnpackedValue::Null,
+            }
+        }
+    };
+    ($unpackables: tt, { $($name: ident $params: tt: $extractor: ident;)* }) => {
+        impl Value {
+            $(impl_value_unpacks!(@mkone $name $params $extractor $unpackables);)*
+        }
+    };
+}
+
+impl_value_unpacks!({
+    String => String,
+    ValueList => List,
+    ValueMap => Attrset,
+    Function => Function,
+    PathBuf => Path,
+    f64 => Double,
+    i32 => Integer,
+    bool => Bool,
+}, {
+    unpack(&Self): extract_from_ref;
+    into_unpacked(Self): extract_from;
+});
+
+impl Value {
+    pub(crate) fn unpack_typed_ref_or_throw<T: ValueUnpackable>(&self) -> T::OutputRef<'_> {
+        T::unpack_ref_from_or_throw(self)
+    }
+
+    pub(crate) fn unpack_typed_clone_or_throw<T: ValueUnpackable>(&self) -> T::Output {
+        T::unpack_from_ref_or_throw(self)
+    }
+
+    pub(crate) fn unpack_typed_or_throw<T: ValueUnpackable>(self) -> T::Output {
+        T::unpack_from_or_throw(self)
     }
 }
 

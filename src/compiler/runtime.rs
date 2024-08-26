@@ -4,7 +4,7 @@ use std::{
 
 use crate::{
     runnable::Runnable, throw, value::LazyValueImpl, Function, LazyValue, Scope, SourceSpan,
-    UnpackedValue, Value, ValueList, ValueMap,
+    UnpackedValue, Value, ValueList, ValueMap, ValueUnpackable,
 };
 
 use super::{CompiledParameter, Executable};
@@ -35,9 +35,7 @@ pub unsafe extern "C-unwind" fn create_function_scope(
             binding,
             ignore_unmatched,
         } => {
-            let UnpackedValue::Attrset(heapvalue) = value.evaluate_mut().unpack() else {
-                panic!("cannot unpack non-attrset value in pattern parameter");
-            };
+            let heapvalue = ValueMap::unpack_from_ref_or_throw(value.evaluate_mut());
             let scope = Scope::from_map(ValueMap::new(), previous);
             let scope_map = &mut *((*scope).values as *mut ValueMap);
             let mut found_keys = 0;
@@ -78,23 +76,10 @@ pub unsafe extern "C" fn create_lazy_value(scope: *mut Scope, runnable: *const R
 
 pub unsafe extern "C-unwind" fn create_lazy_attrset_access(
     attrset: ManuallyDrop<Value>,
-    mut keyv: Value,
+    keyv: Value,
 ) -> Value {
-    let mut attrset = ManuallyDrop::into_inner(attrset.clone());
-    LazyValue::from_closure(move || {
-        let UnpackedValue::String(key) = keyv.evaluate_mut().unpack() else {
-            throw!("Cannot inherit non-string name type {}", keyv.kind());
-        };
-        let UnpackedValue::Attrset(map) = attrset.evaluate_mut().unpack() else {
-            throw!("Cannot inherit from non-attrset type {}", attrset.kind());
-        };
-
-        (*map.get())
-            .get(&**key)
-            .unwrap_or_else(|| throw!("Inherited key {key} does not exist in {attrset}"))
-            .clone()
-    })
-    .into()
+    let attrset = ManuallyDrop::into_inner(attrset.clone());
+    LazyValue::new_attribute_access(attrset, keyv).into()
 }
 
 pub unsafe extern "C" fn map_create() -> *mut ValueMap {
@@ -113,9 +98,7 @@ pub unsafe extern "C" fn map_insert_constant(map: *mut ValueMap, key: *const Str
 }
 
 pub unsafe extern "C-unwind" fn map_insert_dynamic(map: *mut ValueMap, key: Value, value: Value) {
-    let UnpackedValue::String(x) = key.into_evaluated().into_unpacked() else {
-        throw!("non-string dynamic map key");
-    };
+    let x = String::unpack_from_or_throw(key.into_evaluated());
     (*map).insert(Rc::unwrap_or_clone(x), value);
 }
 
@@ -133,13 +116,7 @@ pub unsafe extern "C-unwind" fn scope_create_with(
 ) -> *mut Scope {
     let namespace_rc = Rc::from_raw(namespace);
     Scope::with_new_lazy_implicit(previous, move || {
-        match namespace_rc.run(previous, Value::NULL).into_unpacked() {
-            UnpackedValue::Attrset(attrs) => attrs,
-            other => throw!(
-                "with-statement namespace evaluated to a {} instead of an attribute set",
-                other.kind()
-            ),
-        }
+        ValueMap::unpack_from_or_throw(namespace_rc.run(previous, Value::NULL))
     })
 }
 
@@ -151,28 +128,22 @@ pub unsafe extern "C-unwind" fn attrset_get(
 ) -> Value {
     let mut current = values.add(components).read();
     for i in 0..components {
-        let UnpackedValue::String(name) = values.add(i).read().into_unpacked() else {
-            throw!("attribute name is not a string")
-        };
-        current = match current.into_evaluated().into_unpacked() {
-            UnpackedValue::Attrset(x) => {
-                let map = &*x.get();
-                match map.get(name.as_str()).cloned() {
-                    Some(x) => x,
-                    None => {
-                        if fallback.is_null() {
-                            throw!("{map:?}.{name:?} does not exist")
-                        } else {
-                            return LazyValue::from_runnable(scope, unsafe {
-                                Rc::increment_strong_count(fallback);
-                                Rc::from_raw(fallback)
-                            })
-                            .into();
-                        }
-                    }
+        let name = String::unpack_from_or_throw(values.add(i).read());
+        let map = ValueMap::unpack_from_or_throw(current.into_evaluated());
+        let map = &*map.get();
+        current = match map.get(&*name).cloned() {
+            Some(x) => x,
+            None => {
+                if fallback.is_null() {
+                    throw!("{map:?}.{name:?} does not exist")
+                } else {
+                    return LazyValue::from_runnable(scope, unsafe {
+                        Rc::increment_strong_count(fallback);
+                        Rc::from_raw(fallback)
+                    })
+                    .into();
                 }
             }
-            _ => throw!("not an attribute set"),
         };
     }
 

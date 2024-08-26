@@ -6,7 +6,12 @@ use std::{
 };
 
 use crate::{
-    dwarf::*, exception::*, perfstats::measure_jit_codegen_time, runnable::{Runnable, RunnableVTable}, unwind::*, Function, Operation, Parameter, Program, Scope, SourceSpan, UnpackedValue, Value, ValueKind
+    dwarf::*,
+    exception::*,
+    perfstats::measure_jit_codegen_time,
+    runnable::{Runnable, RunnableVTable},
+    unwind::*,
+    Function, Operation, Parameter, Program, Scope, SourceSpan, UnpackedValue, Value, ValueKind,
 };
 use iced_x86::{code_asm::*, BlockEncoderOptions};
 use nix::libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -189,15 +194,15 @@ impl Compiler {
 
     pub fn compile(
         &mut self,
-        program: Program,
-        param: Option<Parameter>,
+        program: &Program,
+        param: Option<&Parameter>,
     ) -> Result<Rc<Runnable<Executable>>, IcedError> {
         let mut _tc = measure_jit_codegen_time();
         // let debug_header = format!("{program:?}");
 
         let mut closure = ExecutableClosure::new(param.map(|param| {
             Box::new(match param {
-                Parameter::Ident(name) => CompiledParameter::Ident(name),
+                Parameter::Ident(name) => CompiledParameter::Ident(name.to_string()),
                 Parameter::Pattern {
                     entries,
                     binding,
@@ -207,16 +212,17 @@ impl Compiler {
                         .into_iter()
                         .map(|(name, default)| {
                             Ok::<(String, _), IcedError>((
-                                name,
+                                name.to_string(),
                                 default
+                                    .as_ref()
                                     .map(|program| self.compile(program, None))
                                     .transpose()?,
                             ))
                         })
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap(),
-                    binding,
-                    ignore_unmatched,
+                    binding: binding.clone(),
+                    ignore_unmatched: *ignore_unmatched,
                 },
             })
         }));
@@ -315,7 +321,7 @@ impl Compiler {
                 asm.mov(r15, rsi)?;
             }
 
-            for operation in program.operations {
+            for operation in program.operations.iter() {
                 macro_rules! unlazy {
                 ($reg: ident, tmp = $tmp: ident) => {
                     let mut _unlazy = asm.create_label();
@@ -432,13 +438,13 @@ impl Compiler {
 
                 match operation {
                     Operation::Push(value) => {
-                        asm.mov(rdi, closure.intern(value).into_raw())?;
+                        asm.mov(rdi, closure.intern(value.clone()).into_raw())?;
                         call!(rust value_ref);
                         asm.push(rax)?;
                         stack_values += 1;
                     }
                     Operation::PushFunction(param, program) => {
-                        let raw = closure.intern(self.compile(program, Some(param))?);
+                        let raw = closure.intern(self.compile(&*program, Some(param))?);
                         asm.mov(rdi, raw as u64)?;
                         asm.mov(rsi, r15)?;
                         call!(rust create_function_value);
@@ -452,7 +458,7 @@ impl Compiler {
                             mov r12, rax;
                         });
 
-                        if rec { emit_asm!(asm, {
+                        if *rec { emit_asm!(asm, {
                             mov rdi, rax;
                             mov rsi, r15;
                             { call!(rust map_create_recursive_scope); }
@@ -460,11 +466,11 @@ impl Compiler {
                         }); }
 
                         for program in parents.into_iter().rev() {
-                            let runnable = closure.intern(self.compile(program, None)?);
+                            let runnable = closure.intern(self.compile(&*program, None)?);
                             emit_asm!(asm, {
                                 mov rdi, r15;
                                 mov rsi, runnable as u64;
-                                { call!(rust create_lazy_value); } 
+                                { call!(rust create_lazy_value); }
                                 push rax;
                                 { stack_values += 1; }
                             });
@@ -477,7 +483,7 @@ impl Compiler {
                     },
 
                     Operation::ConstantAttrPop(name) => {
-                        let name = closure.intern(name);
+                        let name = closure.intern(name.to_string());
                         emit_asm!(asm, {
                             pop rdx;
                             { stack_values -= 1; }
@@ -487,12 +493,12 @@ impl Compiler {
                         });
                     },
                     Operation::ConstantAttrLazy(name, value) => {
-                        let name = closure.intern(name);
-                        let runnable = closure.intern(self.compile(value, None)?);
+                        let name = closure.intern(name.to_string());
+                        let runnable = closure.intern(self.compile(&*value, None)?);
                         emit_asm!(asm, {
                             mov rdi, r15;
                             mov rsi, runnable as u64;
-                            { call!(rust create_lazy_value); } 
+                            { call!(rust create_lazy_value); }
                             mov rdi, qword_ptr(rsp);
                             mov rsi, name as *const _ as u64;
                             mov rdx, rax;
@@ -500,11 +506,11 @@ impl Compiler {
                         });
                     },
                     Operation::ConstantAttrLoad(name) => {
-                        let name = closure.intern(name);
+                        let name = closure.intern(name.to_string());
                         emit_asm!(asm, {
                             mov rdi, r15;
                             mov rsi, name as *const _ as u64;
-                            { call!(rust scope_lookup); } 
+                            { call!(rust scope_lookup); }
                             mov rdi, qword_ptr(rsp);
                             mov rsi, name as *const _ as u64;
                             mov rdx, rax;
@@ -512,13 +518,12 @@ impl Compiler {
                         });
                     },
                     Operation::ConstantAttrInherit(name, index) => {
-                        let rc = Rc::new(name);
-                        let string_ptr = Rc::as_ptr(&rc);
-                        let name = closure.intern(UnpackedValue::String(rc).pack());
+                        let string_ptr = Rc::as_ptr(name);
+                        let name = closure.intern(UnpackedValue::String(name.clone()).pack());
                         emit_asm!(asm, {
                             mov rdi, qword_ptr(rsp + 8 * (index + 1));
                             mov rsi, name.into_raw();
-                            { call!(rust create_lazy_attrset_access); } 
+                            { call!(rust create_lazy_attrset_access); }
                             mov rdi, qword_ptr(rsp);
                             mov rsi, string_ptr as *const _ as u64;
                             mov rdx, rax;
@@ -534,11 +539,11 @@ impl Compiler {
                         { call!(rust map_insert_dynamic); }
                     }),
                     Operation::DynamicAttrLazy(value) => {
-                        let runnable = closure.intern(self.compile(value, None)?);
+                        let runnable = closure.intern(self.compile(&*value, None)?);
                         emit_asm!(asm, {
                             mov rdi, r15;
                             mov rsi, runnable as u64;
-                            { call!(rust create_lazy_value); } 
+                            { call!(rust create_lazy_value); }
                             pop rsi;
                             { stack_values -= 1; }
                             mov rdi, qword_ptr(rsp);
@@ -612,7 +617,7 @@ impl Compiler {
                         asm.push(rax)?;
                         stack_values += 1;
                     }
-                    Operation::GetAttrConsume { components, default } => {
+                    &Operation::GetAttrConsume { components, ref default } => {
                         let default = if let Some(program) = default {
                             closure.intern(self.compile(program, None)?)
                         } else { std::ptr::null() };
@@ -636,7 +641,7 @@ impl Compiler {
 
                         stack_values -= components;
                     }
-                    Operation::HasAttrpath(len) => {
+                    &Operation::HasAttrpath(len) => {
                         assert!(stack_values > len);
                         asm.mov(r12, qword_ptr(rsp + 8 * len))?;
                         unlazy!(r12, tmp = rdi);
@@ -726,7 +731,7 @@ impl Compiler {
                         stack_values += 1;
                     }
                     Operation::Load(name) => {
-                        let name = closure.intern(name);
+                        let name = closure.intern(name.to_string());
                         asm.mov(rdi, r15)?;
                         asm.mov(rsi, name as *const _ as u64)?;
                         call!(rust scope_lookup);
@@ -849,22 +854,9 @@ impl Compiler {
                         stack_values -= 1;
 
                         let mut end = asm.create_label();
-                        let mut not_an_integer = asm.create_label();
                         let mut not_a_boolean = asm.create_label();
 
-                        unpack!(Integer rdi, tmp = rax, else => not_an_integer);
-                        asm.not(rdi)?;
-                        asm.mov(r10, ValueKind::Integer.as_nan_bits())?;
-                        asm.or(rdi, r10)?;
-
-                        asm.push(rdi)?;
-                        asm.jmp(end)?;
-
-                        asm.set_label(&mut not_an_integer)?;
-
-                        asm.cmp(rax, ValueKind::Bool.as_shifted() as i32)?;
-                        asm.jne(not_a_boolean)?;
-
+                        unpack!(Bool rdi, tmp = rax, else => not_a_boolean);
                         asm.xor(rdi, 0b1)?;
                         asm.push(rdi)?;
                         asm.jmp(end)?;
@@ -872,7 +864,7 @@ impl Compiler {
                         asm.set_label(&mut not_a_boolean)?;
                         asm.mov(
                             rdi,
-                            c"invert attempted on non-integer value".as_ptr() as u64,
+                            c"invert attempted on non-boolean value".as_ptr() as u64,
                         )?;
                         call!(rust asm_panic);
 
@@ -960,7 +952,7 @@ impl Compiler {
                     Operation::SourceSpanPush(span) => {
                         source_span_stack.push((
                             asm.instructions().len(),
-                            span
+                            span.clone()
                         ))
                     }
                     Operation::SourceSpanPop => {
