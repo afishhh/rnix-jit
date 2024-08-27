@@ -1,12 +1,7 @@
 use std::{mem::MaybeUninit, path::PathBuf, rc::Rc};
 
-use iced_x86::code_asm::st;
-use rnix::ast::AttrSet;
-
 use crate::{
-    catch_nix_unwind, compiler::COMPILER, eval, interpreter::into_dynamically_compiled, throw,
-    Function, LazyValue, NixException, Program, Scope, UnpackedValue, Value, ValueKind, ValueMap,
-    ValueUnpackable,
+    catch_nix_unwind, interpreter::into_dynamically_compiled, throw, Function, LazyValue, Program, Scope, UnpackedValue, Value, ValueKind, ValueList, ValueMap
 };
 
 unsafe fn has_or_getattrpath(
@@ -224,7 +219,24 @@ pub fn interpret(mut scope: *mut Scope, program: &Program, compilation_threshold
                         Rc::unwrap_or_clone(stack.pop().unwrap().unpack_typed_or_throw::<String>());
                     stack.push(UnpackedValue::new_path(PathBuf::from(string)).pack())
                 }
-                crate::Operation::Concat => todo!(),
+                crate::Operation::Concat => unsafe {
+                    let rhs = stack
+                        .pop()
+                        .unwrap()
+                        .into_evaluated()
+                        .unpack_typed_or_throw::<ValueList>();
+                    let lhs = stack
+                        .pop()
+                        .unwrap()
+                        .into_evaluated()
+                        .unpack_typed_or_throw::<ValueList>();
+                    let rhs = &*rhs.get();
+                    let lhs = &*lhs.get();
+                    let mut result = Vec::with_capacity(lhs.len() + rhs.len());
+                    result.extend(lhs.iter().cloned());
+                    result.extend(rhs.iter().cloned());
+                    stack.push(UnpackedValue::new_list(result).pack())
+                },
                 crate::Operation::Update => unsafe {
                     let upper = stack
                         .pop()

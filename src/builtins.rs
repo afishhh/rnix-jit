@@ -8,7 +8,7 @@ use std::{
 
 use regex::Regex;
 
-use crate::{perfstats::measure_parsing_time, LazyValue};
+use crate::{perfstats::measure_parsing_time, utils, LazyValue};
 use crate::{throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind, ValueMap};
 
 fn human_valuekind(kind: ValueKind) -> &'static str {
@@ -611,6 +611,7 @@ pub fn create_root_scope() -> *mut Scope {
             })
         }
 
+        #[toplevel_alias]
         fn removeAttrs(attrs: Attrset, names: List) {
             let names = names
                                 .iter()
@@ -627,30 +628,30 @@ pub fn create_root_scope() -> *mut Scope {
 
         fn zipAttrsWith(mapper: Value, sets: List) {
             sets
-                                    .iter()
-                                    .fold(HashMap::<String, Vec<Value>>::new(), |mut acc, value| {
-                                        for (key, value) in
-                                            extract_typed!(Attrset(ref value); "element of list passed to builtins.zipAttrsWith is {} but {} was expected")
-                                        {
-                                            acc.entry(key.to_string())
-                                                .or_default()
-                                                .push(value.clone())
-                                        }
-                                        acc
-                                    })
-                                    .into_iter()
-                                    .map(|(key, values)| {
-                                        (
-                                            key.clone(),
-                                            call_value!(
-                                                "zipAttrsWith",
-                                                mapper.clone(),
-                                                UnpackedValue::new_string(key).pack(),
-                                                UnpackedValue::new_list(values).pack()
-                                            ),
-                                        )
-                                    })
-                                    .collect::<Value>()
+                .iter()
+                .fold(HashMap::<String, Vec<Value>>::new(), |mut acc, value| {
+                    for (key, value) in
+                        extract_typed!(Attrset(ref value); "element of list passed to builtins.zipAttrsWith is {} but {} was expected")
+                    {
+                        acc.entry(key.to_string())
+                            .or_default()
+                            .push(value.clone())
+                    }
+                    acc
+                })
+                .into_iter()
+                .map(|(key, values)| {
+                    (
+                        key.clone(),
+                        call_value!(
+                            "zipAttrsWith",
+                            mapper.clone(),
+                            UnpackedValue::new_string(key).pack(),
+                            UnpackedValue::new_list(values).pack()
+                        ),
+                    )
+                })
+                .collect::<Value>()
         }
 
         fn attrNames(attrset: Attrset) {
@@ -684,6 +685,20 @@ pub fn create_root_scope() -> *mut Scope {
             #[allow(unreachable_code)] // From<!> is not implemented for Value
             {
                 throw!("builtins.genericClosure is not yet implemented") as Value
+            }
+        }
+
+        fn splitVersion(a: String) {
+            utils::VersionComponentIterator::new(a.chars())
+                .map(|x| UnpackedValue::new_string(x.to_string()).pack())
+                .collect::<Value>()
+        }
+
+        fn compareVersions(a: String, b: String) {
+            match utils::version_compare(&a, &b) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
             }
         }
     );

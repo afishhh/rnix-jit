@@ -20,6 +20,7 @@ use ir::*;
 use value::*;
 mod interpreter;
 mod runnable;
+mod utils;
 
 enum ImplicitScopeStorage {
     Evaluated(Rc<UnsafeCell<ValueMap>>),
