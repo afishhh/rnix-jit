@@ -47,7 +47,7 @@ pub unsafe extern "C-unwind" fn create_function_scope(
                         .as_ref()
                         .map(|x| LazyValue::from_runnable(scope, x.clone()).into())
                 }) else {
-                    panic!("missing pattern entry");
+                    throw!("missing pattern entry");
                 };
                 scope_map.insert(key.to_string(), value);
             }
@@ -228,7 +228,7 @@ pub unsafe extern "C-unwind" fn list_concat(a: Value, b: Value) -> Value {
         )
         .pack()
     } else {
-        panic!("concat attempted on non-list operands")
+        throw!("concat attempted on non-list operands")
     }
 }
 
