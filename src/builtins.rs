@@ -512,6 +512,11 @@ pub fn create_root_scope() -> *mut Scope {
             Value::FALSE
         }
 
+        fn unsafeDiscardStringContext(value: Value) {
+            // TODO: String contexts
+            value
+        }
+
         fn addErrorContext(_context: String, value: Value) {
             eprintln!("WARNING: addErrorContext is currently a no-op");
             value
@@ -701,6 +706,21 @@ pub fn create_root_scope() -> *mut Scope {
                 std::cmp::Ordering::Greater => 1,
             }
         }
+
+        fn typeOf(value: Value) {
+            match value.into_evaluated().kind() {
+                ValueKind::Double => "float",
+                ValueKind::Attrset => "set",
+                ValueKind::Function => "lambda",
+                ValueKind::String => "string",
+                ValueKind::Path => "path",
+                ValueKind::List => "list",
+                ValueKind::Integer => "int",
+                ValueKind::Bool => "bool",
+                ValueKind::Lazy => unreachable!(),
+                ValueKind::Null => "null",
+            }
+        }
     );
 
     macro_rules! insert_is_builtin {
@@ -735,6 +755,8 @@ pub fn create_root_scope() -> *mut Scope {
         "currentSystem".to_string(),
         UnpackedValue::new_string("x86_64-linux".to_string()).pack(),
     );
+
+    builtins.insert("storeDir".to_string(), "/nix/store".into());
 
     values.insert("true".to_string(), Value::TRUE);
     values.insert("false".to_string(), Value::FALSE);
@@ -782,35 +804,46 @@ pub fn create_root_scope() -> *mut Scope {
     Scope::from_map(values, std::ptr::null_mut())
 }
 
-pub fn seq(value: &Value, deep: bool) {
+pub fn seq_impl(value: &Value, deep: bool, visited: &mut HashSet<*const ()>) {
     match value.unpack() {
         UnpackedValue::Integer(_) => (),
         UnpackedValue::Double(_) => (),
         UnpackedValue::Bool(_) => (),
         UnpackedValue::List(value) => {
             let list = unsafe { &mut *value.get() };
+            if !visited.insert(list as *const _ as *const ()) {
+                return;
+            }
             for value in list.iter_mut() {
                 let value = value.evaluate_mut();
                 if deep {
-                    seq(value, deep);
+                    seq_impl(value, deep, visited);
                 }
             }
         }
         UnpackedValue::Attrset(value) => {
             let map = unsafe { &mut *value.get() };
+            if !visited.insert(map as *const _ as *const ()) {
+                return;
+            }
             for (_, value) in map.iter_mut() {
                 let value = value.evaluate_mut();
                 if deep {
-                    seq(value, deep);
+                    seq_impl(value, deep, visited);
                 }
             }
         }
         UnpackedValue::String(_) => (),
         UnpackedValue::Path(_) => (),
         UnpackedValue::Function(_) => (),
-        UnpackedValue::Lazy(value) => seq(value.evaluate(), deep),
+        UnpackedValue::Lazy(value) => seq_impl(value.evaluate(), deep, visited),
         UnpackedValue::Null => (),
     }
+}
+
+pub fn seq(value: &Value, deep: bool) {
+    let mut visited = HashSet::new();
+    seq_impl(value, deep, &mut visited)
 }
 
 pub(crate) fn eval_throwing(root: PathBuf, filename: String, code: String) -> Value {
@@ -834,7 +867,7 @@ pub(crate) fn eval_throwing(root: PathBuf, filename: String, code: String) -> Va
         "HYBRID" => 10,
         h if h.starts_with("HYBRID=") => h.strip_prefix("HYBRID=").unwrap().parse().unwrap_or(10),
         "COMPILE" => 0,
-        _ => 10
+        _ => 10,
     };
 
     let runnable = crate::interpreter::into_dynamically_compiled(program, None, threshold);

@@ -108,17 +108,16 @@ impl LazyValue {
         ))))
     }
 
-    pub fn new_attribute_access(mut attrset: Value, mut key: Value) -> LazyValue {
+    pub fn new_attribute_access(attrset: Value, mut key: Value) -> LazyValue {
         LazyValue::from_closure(move || {
             let key = String::unpack_ref_from_or_throw(key.evaluate_mut());
-            let map = ValueMap::unpack_ref_from_or_throw(attrset.evaluate_mut());
+            let attrset = attrset.into_evaluated();
+            let map = ValueMap::unpack_ref_from_or_throw(&attrset);
 
-            unsafe {
-                (*map.get())
-                    .get(&**key)
-                    .unwrap_or_else(|| throw!("Inherited key {key} does not exist in {attrset}"))
-                    .clone()
-            }
+            unsafe { &*map.get() }
+                .get(&**key)
+                .unwrap_or_else(|| throw!("Inherited key {key} does not exist in {attrset}"))
+                .clone()
         })
     }
 
@@ -369,11 +368,9 @@ impl UnpackedValue {
                 }
             }
             Self::Path(value) => write!(f, "{}", value.display()),
-            Self::List(value) => {
-                Self::fmt_list_display(unsafe { &*(value.get()) }, depth, f, false)
-            }
+            Self::List(value) => Self::fmt_list_display(unsafe { &*value.get() }, depth, f, false),
             Self::Attrset(value) => {
-                Self::fmt_attrset_display(unsafe { &*(value.get()) }, depth, f, false)
+                Self::fmt_attrset_display(unsafe { &*value.get() }, depth, f, false)
             }
             Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
@@ -404,9 +401,9 @@ impl UnpackedValue {
             Self::Path(value) => {
                 write!(f, "{}", value.display())
             }
-            Self::List(value) => Self::fmt_list_display(unsafe { &*(value.get()) }, depth, f, true),
+            Self::List(value) => Self::fmt_list_display(unsafe { &*value.get() }, depth, f, true),
             Self::Attrset(value) => {
-                Self::fmt_attrset_display(unsafe { &*(value.get()) }, depth, f, true)
+                Self::fmt_attrset_display(unsafe { &*value.get() }, depth, f, true)
             }
             Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
@@ -643,11 +640,9 @@ impl Value {
 
     pub fn get_attribute(&self, key: &str) -> &Value {
         let set = self.unpack_typed_ref_or_throw::<ValueMap>();
-        unsafe {
-            (*set.get())
-                .get(key)
-                .unwrap_or_else(|| throw!("{self} does not contain attribute {key}"))
-        }
+        unsafe { &*set.get() }
+            .get(key)
+            .unwrap_or_else(|| throw!("{self} does not contain attribute {key}"))
     }
 
     pub(crate) fn make_mut_string(self) -> Value {

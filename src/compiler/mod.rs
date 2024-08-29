@@ -873,9 +873,13 @@ impl Compiler {
                     }
                     Operation::Concat => {
                         assert!(stack_values >= 2);
+                        asm.pop(r12)?;
+                        stack_values -= 1;
+                        unlazy!(r12, tmp = rdi);
                         asm.pop(rdi)?;
-                        asm.pop(rsi)?;
-                        stack_values -= 2;
+                        stack_values -= 1;
+                        unlazy!(rdi, tmp = rcx);
+                        asm.mov(rsi, r12)?;
 
                         call!(rust list_concat);
 

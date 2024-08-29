@@ -116,7 +116,10 @@ pub unsafe extern "C-unwind" fn scope_create_with(
 ) -> *mut Scope {
     let namespace_rc = Rc::from_raw(namespace);
     Scope::with_new_lazy_implicit(previous, move || {
-        ValueMap::unpack_from_or_throw(namespace_rc.run(previous, Value::NULL))
+        namespace_rc
+            .run(previous, Value::NULL)
+            .into_evaluated()
+            .unpack_typed_or_throw::<ValueMap>()
     })
 }
 

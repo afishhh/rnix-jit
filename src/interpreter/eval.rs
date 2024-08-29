@@ -1,7 +1,8 @@
 use std::{mem::MaybeUninit, path::PathBuf, rc::Rc};
 
 use crate::{
-    catch_nix_unwind, interpreter::into_dynamically_compiled, throw, Function, LazyValue, Program, Scope, UnpackedValue, Value, ValueKind, ValueList, ValueMap
+    catch_nix_unwind, interpreter::into_dynamically_compiled, throw, Function, LazyValue, Program,
+    Scope, UnpackedValue, Value, ValueKind, ValueList, ValueMap,
 };
 
 unsafe fn has_or_getattrpath(
@@ -283,7 +284,14 @@ pub fn interpret(mut scope: *mut Scope, program: &Program, compilation_threshold
                         scope,
                     );
                 },
-                crate::Operation::ScopeWith(_) => todo!(),
+                crate::Operation::ScopeWith(what) => {
+                    let runnable =
+                        into_dynamically_compiled(what.clone(), None, compilation_threshold);
+                    scope = Scope::with_new_lazy_implicit(scope, move || {
+                        unsafe { runnable.run(scope, Value::NULL).into_evaluated() }
+                            .unpack_typed_or_throw::<ValueMap>()
+                    });
+                }
                 crate::Operation::Load(x) => stack.push(unsafe { Scope::lookup(scope, x) }),
                 crate::Operation::ScopeLeave => scope = unsafe { (*scope).previous },
                 crate::Operation::IfElse(then, otherwise) => {
