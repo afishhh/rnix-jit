@@ -8,7 +8,14 @@ use std::{
 
 use regex::Regex;
 
-use crate::{perfstats::measure_parsing_time, utils, LazyValue};
+use crate::{
+    perfstats::measure_parsing_time,
+    utils::{
+        self,
+        json::{JsonPrinter, JsonValue},
+    },
+    LazyValue,
+};
 use crate::{throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind, ValueMap};
 
 fn human_valuekind(kind: ValueKind) -> &'static str {
@@ -721,6 +728,14 @@ pub fn create_root_scope() -> *mut Scope {
                 ValueKind::Null => "null",
             }
         }
+
+        fn fromJSON(x: String) {
+            from_json_str(&x)
+        }
+
+        fn toJSON(x: Value) {
+            to_json(&x)
+        }
     );
 
     macro_rules! insert_is_builtin {
@@ -844,6 +859,60 @@ pub fn seq_impl(value: &Value, deep: bool, visited: &mut HashSet<*const ()>) {
 pub fn seq(value: &Value, deep: bool) {
     let mut visited = HashSet::new();
     seq_impl(value, deep, &mut visited)
+}
+
+fn from_json(text: JsonValue) -> Value {
+    match text {
+        JsonValue::Object(x) => x.into_iter().map(|(k, v)| (k, from_json(v))).collect(),
+        JsonValue::List(x) => x.into_iter().map(from_json).collect(),
+        JsonValue::String(x) => UnpackedValue::new_string(x).pack(),
+        JsonValue::Integer(i) => UnpackedValue::Integer(
+            i.try_into()
+                .unwrap_or_else(|_| throw!("json integer out of range")),
+        )
+        .pack(),
+        JsonValue::Float(f) => UnpackedValue::Double(f).pack(),
+    }
+}
+
+fn from_json_str(text: &str) -> Value {
+    from_json(crate::utils::json::parse(text, false))
+}
+
+fn to_json_impl(value: &Value, output: &mut JsonPrinter) {
+    match value.evaluate().unpack() {
+        UnpackedValue::Integer(i) => output.integer(i.into()),
+        UnpackedValue::Double(f) => output.float(f),
+        UnpackedValue::Bool(b) => output.bool(b),
+        UnpackedValue::List(l) => {
+            output.start_list();
+            for value in unsafe { &*l.get() }.iter() {
+                to_json_impl(value, output);
+            }
+            output.end_list()
+        }
+        UnpackedValue::Attrset(s) => {
+            output.start_object();
+            for (key, value) in unsafe { &*s.get() }.iter() {
+                output.key(key);
+                to_json_impl(value, output);
+            }
+            output.end_object()
+        }
+        UnpackedValue::String(s) => output.string(&s),
+        UnpackedValue::Function(_) => throw!("cannot convert a function to json"),
+        UnpackedValue::Path(_) => throw!("TODO: cannot convert a path to json"),
+        UnpackedValue::Lazy(_) => unreachable!(),
+        UnpackedValue::Null => output.null(),
+    };
+}
+
+fn to_json(value: &Value) -> String {
+    let mut printer = JsonPrinter::new();
+
+    to_json_impl(value, &mut printer);
+
+    printer.finish()
 }
 
 pub(crate) fn eval_throwing(root: PathBuf, filename: String, code: String) -> Value {

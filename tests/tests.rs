@@ -161,3 +161,17 @@ compare_file_eval!(
         };
     }
 );
+
+compare_file_eval!(from_json, "fromJSON.nix", {
+    strict = {
+        a = 2;
+        c = [1, "2", {}];
+    };
+});
+
+compare_file_eval!(to_json, "toJSON.nix", {
+    emptyObject = "{}";
+    manyDiverseThings =
+        "{\"a\":{},\"b\":{\"c\":2,\"d\":[\"hello\"]},\"c\":[\"a\",2,{\"value\":\"three\"}]}";
+    manyEmptyThings = "{\"a\":[],\"b\":{},\"c\":[{},{},{},[],[],[]]}";
+});
