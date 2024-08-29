@@ -1,5 +1,5 @@
 use std::{
-    cell::UnsafeCell, ffi::CStr, mem::ManuallyDrop, ops::Deref, path::PathBuf, ptr::NonNull, rc::Rc,
+    cell::UnsafeCell, collections::HashSet, ffi::CStr, mem::ManuallyDrop, ops::Deref, path::PathBuf, ptr::NonNull, rc::Rc
 };
 
 use crate::{
@@ -59,7 +59,7 @@ pub unsafe extern "C-unwind" fn create_function_scope(
             }
             // scope.get("hello");
             let mut s = String::new();
-            UnpackedValue::fmt_attrset_display(scope_map, 0, &mut s, true).unwrap();
+            UnpackedValue::fmt_attrset_display(scope_map, 0, &mut s, true, &mut HashSet::new()).unwrap();
             // println!("{s}");
             scope
         }

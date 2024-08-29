@@ -43,12 +43,6 @@ impl<T> Runnable<T> {
         }
     }
 
-    pub(crate) unsafe fn new_erased_rc(vtable: RunnableVTable, value: T) -> Rc<Runnable> {
-        Rc::from_raw(Runnable::erase(Rc::into_raw(Rc::new(Self::new(
-            vtable, value,
-        )))))
-    }
-
     #[inline(always)]
     pub(crate) unsafe fn vtable(&self) -> &RunnableVTable {
         unsafe { &(*self.vtable.get()) }
@@ -62,6 +56,11 @@ impl<T> Runnable<T> {
     #[inline(always)]
     pub(crate) fn erase(this: *const Runnable<T>) -> *const Runnable<()> {
         unsafe { &*(this as *const Runnable) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn into_erased_rc(self) -> Rc<Runnable> {
+        unsafe { Rc::from_raw(Runnable::erase(Rc::into_raw(Rc::new(self)))) }
     }
 }
 

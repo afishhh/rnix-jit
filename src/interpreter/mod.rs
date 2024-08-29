@@ -27,10 +27,11 @@ pub fn into_interpreted(program: Rc<Program>, parameter: Option<Parameter>) -> R
     }
 
     unsafe {
-        Runnable::new_erased_rc(
+        Runnable::new(
             RunnableVTable::with_default_drop::<Interpreted>(run),
             Interpreted { program, parameter },
         )
+        .into_erased_rc()
     }
 }
 
@@ -57,7 +58,8 @@ fn create_function_scope(
                 let value = match attrs.get(name).cloned() {
                     Some(value) => {
                         found_keys += 1;
-                        value},
+                        value
+                    }
                     None => match default {
                         Some(fallback) => LazyValue::from_runnable(
                             scope,
@@ -139,7 +141,7 @@ pub fn into_dynamically_compiled(
     }
 
     unsafe {
-        Runnable::new_erased_rc(
+        Runnable::new(
             RunnableVTable::with_default_drop::<DynamicallyCompiled>(run),
             DynamicallyCompiled {
                 times_executed: 0,
@@ -149,5 +151,6 @@ pub fn into_dynamically_compiled(
                 },
             },
         )
+        .into_erased_rc()
     }
 }

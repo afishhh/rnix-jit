@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::{Debug, Display, Write as FmtWrite},
     mem::MaybeUninit,
     path::PathBuf,
@@ -229,7 +229,8 @@ impl UnpackedValue {
     }
 
     pub fn new_function(function: impl FnMut(Value) -> Value + 'static) -> UnpackedValue {
-        let rc = Rc::new(Runnable::from_closure(function));
+        let rc = Runnable::from_closure(function).into_erased_rc()
+        ;
         let rc = unsafe { Rc::from_raw(Runnable::erase(Rc::into_raw(rc))) };
         UnpackedValue::Function(Rc::new(Function::new(rc, std::ptr::null_mut())))
     }
@@ -293,7 +294,12 @@ impl UnpackedValue {
         depth: usize,
         f: &mut impl FmtWrite,
         debug: bool,
+        visited: &mut HashSet<*const ()>,
     ) -> std::fmt::Result {
+        if !visited.insert(map as *const _ as *const ()) {
+            return writeln!(f, "...");
+        }
+
         writeln!(f, "{{")?;
         for (key, value) in map.iter() {
             for _ in 0..=depth {
@@ -301,9 +307,15 @@ impl UnpackedValue {
             }
             write!(f, "{key} = ")?;
             if debug {
-                value.clone().unpack().fmt_debug_rec(depth + 1, f)?
+                value
+                    .clone()
+                    .unpack()
+                    .fmt_debug_rec(depth + 1, f, visited)?
             } else {
-                value.clone().unpack().fmt_display_rec(depth + 1, f)?
+                value
+                    .clone()
+                    .unpack()
+                    .fmt_display_rec(depth + 1, f, visited)?
             }
             writeln!(f, ";")?;
         }
@@ -314,11 +326,16 @@ impl UnpackedValue {
     }
 
     pub(crate) fn fmt_list_display(
-        list: &[Value],
+        list: &ValueList,
         depth: usize,
         f: &mut impl FmtWrite,
         debug: bool,
+        visited: &mut HashSet<*const ()>,
     ) -> std::fmt::Result {
+        if !visited.insert(list as *const _ as *const ()) {
+            return writeln!(f, "...");
+        }
+
         if list.len() > 2 {
             writeln!(f, "[")?;
         } else {
@@ -331,9 +348,15 @@ impl UnpackedValue {
                 }
             }
             if debug {
-                value.clone().unpack().fmt_debug_rec(depth + 1, f)?
+                value
+                    .clone()
+                    .unpack()
+                    .fmt_debug_rec(depth + 1, f, visited)?
             } else {
-                value.clone().unpack().fmt_display_rec(depth + 1, f)?
+                value
+                    .clone()
+                    .unpack()
+                    .fmt_display_rec(depth + 1, f, visited)?
             }
             if list.len() > 2 {
                 writeln!(f)?;
@@ -349,7 +372,12 @@ impl UnpackedValue {
         write!(f, "]")
     }
 
-    pub(crate) fn fmt_display_rec(&self, depth: usize, f: &mut impl FmtWrite) -> std::fmt::Result {
+    pub(crate) fn fmt_display_rec(
+        &self,
+        depth: usize,
+        f: &mut impl FmtWrite,
+        visited: &mut HashSet<*const ()>,
+    ) -> std::fmt::Result {
         match self {
             Self::Integer(value) => {
                 write!(f, "{value}")
@@ -368,14 +396,16 @@ impl UnpackedValue {
                 }
             }
             Self::Path(value) => write!(f, "{}", value.display()),
-            Self::List(value) => Self::fmt_list_display(unsafe { &*value.get() }, depth, f, false),
+            Self::List(value) => {
+                Self::fmt_list_display(unsafe { &*value.get() }, depth, f, false, visited)
+            }
             Self::Attrset(value) => {
-                Self::fmt_attrset_display(unsafe { &*value.get() }, depth, f, false)
+                Self::fmt_attrset_display(unsafe { &*value.get() }, depth, f, false, visited)
             }
             Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
-                    x.clone().unpack().fmt_display_rec(depth, f)
+                    x.clone().unpack().fmt_display_rec(depth, f, visited)
                 } else {
                     write!(f, "...")
                 }
@@ -384,7 +414,12 @@ impl UnpackedValue {
         }
     }
 
-    pub(crate) fn fmt_debug_rec(&self, depth: usize, f: &mut impl FmtWrite) -> std::fmt::Result {
+    pub(crate) fn fmt_debug_rec(
+        &self,
+        depth: usize,
+        f: &mut impl FmtWrite,
+        visited: &mut HashSet<*const ()>,
+    ) -> std::fmt::Result {
         match self {
             Self::Integer(value) => {
                 write!(f, "{value}")
@@ -401,15 +436,17 @@ impl UnpackedValue {
             Self::Path(value) => {
                 write!(f, "{}", value.display())
             }
-            Self::List(value) => Self::fmt_list_display(unsafe { &*value.get() }, depth, f, true),
+            Self::List(value) => {
+                Self::fmt_list_display(unsafe { &*value.get() }, depth, f, true, visited)
+            }
             Self::Attrset(value) => {
-                Self::fmt_attrset_display(unsafe { &*value.get() }, depth, f, true)
+                Self::fmt_attrset_display(unsafe { &*value.get() }, depth, f, true, visited)
             }
             Self::Function(_) => write!(f, "«lambda»"),
             Self::Lazy(x) => {
                 if let Some(x) = x.as_maybe_evaluated() {
                     write!(f, "«lazy ")?;
-                    x.unpack().fmt_debug_rec(depth, f)?;
+                    x.unpack().fmt_debug_rec(depth, f, visited)?;
                     write!(f, "»")
                 } else {
                     write!(f, "«lazy»")
@@ -422,13 +459,13 @@ impl UnpackedValue {
 
 impl Display for UnpackedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_display_rec(0, f)
+        self.fmt_display_rec(0, f, &mut HashSet::new())
     }
 }
 
 impl Debug for UnpackedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_debug_rec(0, f)
+        self.fmt_debug_rec(0, f, &mut HashSet::new())
     }
 }
 
@@ -689,25 +726,55 @@ impl PartialEq for Value {
 }
 
 impl Value {
-    pub(crate) extern "C-unwind" fn equal(self, other: Value) -> Value {
+    pub(crate) extern "C-unwind" fn c_owned_equal(self, other: Value) -> Value {
         (self == other).into()
     }
 
-    pub(crate) extern "C-unwind" fn not_equal(self, other: Value) -> Value {
+    pub(crate) fn equal(&self, other: &Value) -> Value {
+        (self == other).into()
+    }
+
+    pub(crate) extern "C-unwind" fn c_owned_not_equal(self, other: Value) -> Value {
+        (self != other).into()
+    }
+
+    pub(crate) fn not_equal(&self, other: &Value) -> Value {
         (self != other).into()
     }
 }
 
 macro_rules! value_impl_binary_operator {
     (
+        $cname: ident,
         $name: ident,
         $op: tt,
         $(
             $kind: ident($a: ident, $b: ident) => $expr: expr
         ),*
     ) => {
-        pub(crate) extern "C-unwind" fn $name(self, other: Value) -> Value {
+        // TODO: just implement proper value destruction in assembly
+        //       could just call drop
+        pub(crate) extern "C-unwind" fn $cname(self, other: Value) -> Value {
             match (self.into_unpacked(), other.into_unpacked()) {
+                $((UnpackedValue::$kind($a), UnpackedValue::$kind($b)) => $expr.into(),)*
+                (a, b) => throw!(
+                    concat!(stringify!($op), " is not supported between values of type {} and {}"),
+                    a.kind(), b.kind()
+                )
+            }
+        }
+        value_impl_binary_operator!(!, $name, $op, $($kind($a, $b) => $expr),*);
+    };
+    (
+        !,
+        $name: ident,
+        $op: tt,
+        $(
+            $kind: ident($a: ident, $b: ident) => $expr: expr
+        ),*
+    ) => {
+        pub fn $name(&self, other: &Value) -> Value {
+            match (self.unpack(), other.unpack()) {
                 $((UnpackedValue::$kind($a), UnpackedValue::$kind($b)) => $expr.into(),)*
                 (a, b) => throw!(
                     concat!(stringify!($op), " is not supported between values of type {} and {}"),
@@ -720,12 +787,13 @@ macro_rules! value_impl_binary_operator {
 
 macro_rules! value_impl_binary_operators {
     {
-        $($op: tt $name: ident($a: ident, $b: ident) {
+        $($op: tt ($cname: tt $name: ident)($a: ident, $b: ident) {
             $($kind: ident => $expr: expr),*
         };)*
     } => {
         $(
             value_impl_binary_operator!(
+                $cname,
                 $name,
                 $op,
                 $($kind($a, $b) => $expr),*
@@ -737,7 +805,7 @@ macro_rules! value_impl_binary_operators {
 impl Value {
     // TODO: support mixing Integer and Double operands
     value_impl_binary_operators! {
-        +add(a, b) {
+        +(c_owned_add add)(a, b) {
             Integer => a + b,
             Double => a + b,
             String => {
@@ -747,13 +815,16 @@ impl Value {
                     result
             }
         };
-        -sub(a, b) { Integer => a - b, Double => a - b };
-        *mul(a, b) { Integer => a * b, Double => a * b };
-        /div(a, b) { Integer => a / b, Double => a / b };
-        <less(a, b) { Integer => a < b, String => a < b };
-        <=less_or_equal(a, b) { Integer => a <= b, String => a <= b };
-        >=greater_or_equal(a, b) { Integer => a >= b, String => a >= b };
-        >greater(a, b) { Integer => a > b, String => a > b };
+        -(c_owned_sub sub)(a, b) { Integer => a - b, Double => a - b };
+        *(c_owned_mul mul)(a, b) { Integer => a * b, Double => a * b };
+        /(c_owned_div div)(a, b) { Integer => a / b, Double => a / b };
+        <(c_owned_less less)(a, b) { Integer => a < b, String => a < b };
+        <=(c_owned_less_or_equal less_or_equal)(a, b) { Integer => a <= b, String => a <= b };
+        >=(c_owned_greater_or_equal greater_or_equal)(a, b) { Integer => a >= b, String => a >= b };
+        >(c_owned_greater greater)(a, b) { Integer => a > b, String => a > b };
+        >(! bit_or)(a, b) { Integer => a | b };
+        >(! bit_and)(a, b) { Integer => a & b };
+        >(! bit_xor)(a, b) { Integer => a ^ b };
     }
 }
 
@@ -768,7 +839,7 @@ impl Clone for Value {
 
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.unpack().fmt_display_rec(0, f)
+        self.unpack().fmt_display_rec(0, f, &mut HashSet::new())
     }
 }
 impl Debug for Value {

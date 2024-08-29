@@ -56,7 +56,7 @@ pub fn interpret(mut scope: *mut Scope, program: &Program, compilation_threshold
                 ($op: ident) => {{
                     let b = stack.pop().unwrap();
                     let a = stack.pop().unwrap();
-                    stack.push(Value::$op(a.into_evaluated(), b.into_evaluated()));
+                    stack.push(Value::$op(a.evaluate(), b.evaluate()));
                 }};
             }
 

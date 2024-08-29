@@ -268,8 +268,7 @@ pub fn create_root_scope() -> *mut Scope {
         // ---- list-related builtins ----
         fn elem(needle: Value, list: List) {
             for value in list.iter() {
-                // FIXME: less cloning
-                if value.evaluate().clone().equal(needle.clone()).is_true() {
+                if value.evaluate().equal(&needle).is_true() {
                     return Value::TRUE;
                 }
             }
@@ -736,6 +735,38 @@ pub fn create_root_scope() -> *mut Scope {
         fn toJSON(x: Value) {
             to_json(&x)
         }
+
+        fn add(lhs: Value, rhs: Value) {
+            Value::add(&lhs, &rhs)
+        }
+
+        fn sub(lhs: Value, rhs: Value) {
+            Value::sub(&lhs, &rhs)
+        }
+
+        fn mul(lhs: Value, rhs: Value) {
+            Value::mul(&lhs, &rhs)
+        }
+
+        fn div(lhs: Value, rhs: Value) {
+            Value::div(&lhs, &rhs)
+        }
+
+        fn lessThan(lhs: Value, rhs: Value) {
+            Value::less(&lhs, &rhs)
+        }
+
+        fn bitAnd(lhs: Value, rhs: Value) {
+            Value::bit_and(&lhs, &rhs)
+        }
+
+        fn bitOr(lhs: Value, rhs: Value) {
+            Value::bit_or(&lhs, &rhs)
+        }
+
+        fn bitXor(lhs: Value, rhs: Value) {
+            Value::bit_xor(&lhs, &rhs)
+        }
     );
 
     macro_rules! insert_is_builtin {
@@ -743,12 +774,7 @@ pub fn create_root_scope() -> *mut Scope {
             builtins.insert(
                 $name.to_string(),
                 UnpackedValue::new_function(|value| {
-                    UnpackedValue::Bool(match value.into_evaluated().unpack() {
-                        UnpackedValue::$type(..) => true,
-                        UnpackedValue::Lazy(_) => unreachable!(),
-                        _ => false,
-                    })
-                    .pack()
+                    UnpackedValue::Bool(value.into_evaluated().is(ValueKind::$type)).pack()
                 })
                 .pack(),
             );
@@ -758,10 +784,7 @@ pub fn create_root_scope() -> *mut Scope {
     insert_is_builtin!("isPath", Path);
     insert_is_builtin!("isString", String);
     insert_is_builtin!("isInt", Integer);
-    builtins.insert(
-        "isFloat".to_string(),
-        UnpackedValue::new_function(|_v| UnpackedValue::Bool(false).pack()).pack(),
-    );
+    insert_is_builtin!("isFloat", Double);
     insert_is_builtin!("isBool", Bool);
     insert_is_builtin!("isAttrs", Attrset);
     insert_is_builtin!("isList", List);

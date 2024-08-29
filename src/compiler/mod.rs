@@ -554,15 +554,15 @@ impl Compiler {
 
                     Operation::Add => impl_binary_operator!(
                         int => retag(Integer) { asm.add(edi, esi)?; rdi },
-                        fallback = Value::add
+                        fallback = Value::c_owned_add
                     ),
                     Operation::Sub => impl_binary_operator!(
                         int => retag(Integer) { asm.sub(edi, esi)?; rdi },
-                        fallback = Value::sub
+                        fallback = Value::c_owned_sub
                     ),
                     Operation::Mul => impl_binary_operator!(
                         int => retag(Integer) { asm.imul_2(edi, esi)?; rdi },
-                        fallback = Value::mul
+                        fallback = Value::c_owned_mul
                     ),
                     Operation::Div => impl_binary_operator!(
                         int => retag(Integer) {
@@ -571,7 +571,7 @@ impl Compiler {
                             asm.idiv(esi)?;
                             rax
                         },
-                        fallback = Value::div
+                        fallback = Value::c_owned_div
                     ),
                     Operation::And(second) => impl_binary_operator!(
                         boolean second,
@@ -592,22 +592,22 @@ impl Compiler {
                         else(rax) => rax
                     ),
                     Operation::Less => impl_binary_operator!(
-                        comparison cmovl or Value::less
+                        comparison cmovl or Value::c_owned_less
                     ),
                     Operation::LessOrEqual => impl_binary_operator!(
-                        comparison cmovle or Value::less_or_equal
+                        comparison cmovle or Value::c_owned_less_or_equal
                     ),
                     Operation::MoreOrEqual => impl_binary_operator!(
-                        comparison cmovge or Value::greater_or_equal
+                        comparison cmovge or Value::c_owned_greater_or_equal
                     ),
                     Operation::More => impl_binary_operator!(
-                        comparison cmovg or Value::greater
+                        comparison cmovg or Value::c_owned_greater
                     ),
                     Operation::Equal => impl_binary_operator!(
-                        comparison cmove or Value::equal
+                        comparison cmove or Value::c_owned_equal
                     ),
                     Operation::NotEqual => impl_binary_operator!(
-                        comparison cmovne or Value::not_equal
+                        comparison cmovne or Value::c_owned_not_equal
                     ),
                     Operation::PushAttrset { parents } => {
                         asm.pop(rdi)?;
