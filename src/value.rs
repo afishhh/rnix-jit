@@ -297,7 +297,7 @@ impl UnpackedValue {
         visited: &mut HashSet<*const ()>,
     ) -> std::fmt::Result {
         if !visited.insert(map as *const _ as *const ()) {
-            return writeln!(f, "...");
+            return write!(f, "...");
         }
 
         writeln!(f, "{{")?;
@@ -333,7 +333,7 @@ impl UnpackedValue {
         visited: &mut HashSet<*const ()>,
     ) -> std::fmt::Result {
         if !visited.insert(list as *const _ as *const ()) {
-            return writeln!(f, "...");
+            return write!(f, "...");
         }
 
         if list.len() > 2 {
