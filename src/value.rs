@@ -229,8 +229,7 @@ impl UnpackedValue {
     }
 
     pub fn new_function(function: impl FnMut(Value) -> Value + 'static) -> UnpackedValue {
-        let rc = Runnable::from_closure(function).into_erased_rc()
-        ;
+        let rc = Runnable::from_closure(function).into_erased_rc();
         let rc = unsafe { Rc::from_raw(Runnable::erase(Rc::into_raw(rc))) };
         UnpackedValue::Function(Rc::new(Function::new(rc, std::ptr::null_mut())))
     }
@@ -250,6 +249,7 @@ impl UnpackedValue {
         }
     }
 
+    #[inline(always)]
     pub fn pack(self) -> Value {
         macro_rules! pack_ptr {
             ($ptr: expr, $kind: ident) => {{

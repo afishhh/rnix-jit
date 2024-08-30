@@ -67,7 +67,7 @@ pub fn interpret(mut scope: *mut Scope, program: &Program, compilation_threshold
                         if lhs.as_raw() == Value::from_bool($svalue).into_raw() {
                             Value::from_bool($sresult)
                         } else if lhs.as_raw() == Value::from_bool(!$svalue).into_raw() {
-                            let rhs = interpret(scope, $rhs, compilation_threshold);
+                            let rhs = interpret(scope, $rhs, compilation_threshold).into_evaluated();
                             if !rhs.is(ValueKind::Bool) {
                                 throw!("second operand of boolean operator is not a boolean");
                             }
@@ -305,7 +305,7 @@ pub fn interpret(mut scope: *mut Scope, program: &Program, compilation_threshold
                     }
                 }
                 crate::Operation::Invert => {
-                    let x = stack.pop().unwrap();
+                    let x = stack.pop().unwrap().into_evaluated();
                     if x.is_true() {
                         stack.push(Value::FALSE);
                     } else if x.is_false() {

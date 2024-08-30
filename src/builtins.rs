@@ -2,19 +2,20 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env::VarError,
     fmt::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
 use regex::Regex;
 
 use crate::{
+    catch_nix_unwind,
     perfstats::measure_parsing_time,
     utils::{
         self,
         json::{JsonPrinter, JsonValue},
     },
-    LazyValue,
+    value, LazyValue, ValueUnpackable,
 };
 use crate::{throw, IRCompiler, NixException, Scope, UnpackedValue, Value, ValueKind, ValueMap};
 
@@ -49,6 +50,26 @@ macro_rules! extract_typed {
     (List($($tt: tt)*); $($fmt: tt)*) => {
         unsafe { &*extract_typed!(@impl List($($tt)*); $($fmt)*).get() }
     };
+    (PathOrAbsoluteString($how: tt $value: expr); $fmtstr: expr $(, $($fmtrest: tt)*)?) => {{
+        let value = $value.evaluate();
+        match value.kind() {
+            ValueKind::Path => value.unpack_typed_ref_or_throw::<PathBuf>().as_path(),
+            ValueKind::String => {
+                let string = value.unpack_typed_ref_or_throw::<String>();
+                let path = Path::new(string);
+                if !path.is_absolute() {
+                    throw!("string {string:?} doesn't represent an absolute path");
+                }
+                path
+            },
+            other => throw!(
+                $fmtstr,
+                human_valuekind(other),
+                "a path or a string representing an absolute path"
+                $(, $($fmtrest)*)?
+            )
+        }
+    }};
     ($what: ident($($tt: tt)*); $($fmt: tt)*) => {
         extract_typed!(@impl $what($($tt)*); $($fmt)*)
     };
@@ -216,25 +237,33 @@ pub fn create_root_scope() -> *mut Scope {
         }
 
         fn trace(message: String, ret: Value) {
-            println!("trace: {message}");
+            eprintln!("trace: {message}");
             ret
         }
 
         #[toplevel_alias]
         fn __dbg(message: Value, ret: Value) {
-            println!("dbg: {message:?}");
+            eprintln!("dbg: {message:?}");
             ret
         }
 
         #[toplevel_alias]
         fn __dbgVal(message: Value) {
             seq(&message, true);
-            println!("dbg: {message:?}");
+            eprintln!("dbg: {message:?}");
             message
         }
 
         #[toplevel_alias]
         fn throw(message: String) {
+            #[allow(unreachable_code)] // From<!> is not implemented for Value
+            {
+                NixException::boxed(Rc::unwrap_or_clone(message)).raise() as Value
+            }
+        }
+
+        #[toplevel_alias]
+        fn abort(message: String) {
             #[allow(unreachable_code)] // From<!> is not implemented for Value
             {
                 NixException::boxed(Rc::unwrap_or_clone(message)).raise() as Value
@@ -263,6 +292,16 @@ pub fn create_root_scope() -> *mut Scope {
         fn deepSeq(seqd: Value, ret: Value) {
             seq(&seqd, true);
             ret
+        }
+
+        fn tryEval(seqd: Value) {
+            let success = try_eval(&seqd);
+            let mut result = ValueMap::new();
+            result.insert("success".to_string(), true.into());
+            if success {
+                result.insert("value".to_string(), seqd.clone());
+            }
+            UnpackedValue::new_attrset(result)
         }
 
         // ---- list-related builtins ----
@@ -360,17 +399,18 @@ pub fn create_root_scope() -> *mut Scope {
                 .collect::<Value>()
         }
 
-        fn concatMap(mapper: Value, lists: List) {
-            lists
-                .iter()
-                .flat_map(|list| {
-                    extract_typed!(List(ref list);
-                    "found {} in list passed to builtins.concatMap while {} was expected"
-                                    )
+        fn concatMap(mapper: Value, list: List) {
+            list.iter()
+                .cloned()
+                .flat_map(|value| {
+                    let mapped: Value = lazy_call_value!("concatMap", mapper.clone(), value);
+                    extract_typed!(
+                        List(move mapped);
+                        "found {} in list passed to builtins.concatMap while {} was expected"
+                    )
                     .iter()
                 })
                 .cloned()
-                .map(|value| -> Value { lazy_call_value!("concatMap", mapper.clone(), value) })
                 .collect::<Value>()
         }
 
@@ -539,15 +579,15 @@ pub fn create_root_scope() -> *mut Scope {
         }
 
         // ---- path-related builtins ----
-        fn pathExists(path: Path) {
+        fn pathExists(path: PathOrAbsoluteString) {
             path.try_exists().unwrap_or_else(|e| throw!("{e}"))
         }
 
-        fn readFile(path: Path) {
-            std::fs::read_to_string(&*path).unwrap_or_else(|e| throw!("{e}"))
+        fn readFile(path: PathOrAbsoluteString) {
+            std::fs::read_to_string(path).unwrap_or_else(|e| throw!("{e}"))
         }
 
-        fn readFileType(path: Path) {
+        fn readFileType(path: PathOrAbsoluteString) {
             let file_type = path
                 .metadata()
                 .unwrap_or_else(|e| throw!("{e}"))
@@ -785,6 +825,7 @@ pub fn create_root_scope() -> *mut Scope {
     insert_is_builtin!("isString", String);
     insert_is_builtin!("isInt", Integer);
     insert_is_builtin!("isFloat", Double);
+    insert_is_builtin!("isFunction", Function);
     insert_is_builtin!("isBool", Bool);
     insert_is_builtin!("isAttrs", Attrset);
     insert_is_builtin!("isList", List);
@@ -795,6 +836,8 @@ pub fn create_root_scope() -> *mut Scope {
     );
 
     builtins.insert("storeDir".to_string(), "/nix/store".into());
+    // The ridiciculous version number is to get around version checks
+    builtins.insert("nixVersion".to_string(), "10.0-rnix-jit".into());
 
     values.insert("true".to_string(), Value::TRUE);
     values.insert("false".to_string(), Value::FALSE);
@@ -882,6 +925,15 @@ pub fn seq_impl(value: &Value, deep: bool, visited: &mut HashSet<*const ()>) {
 pub fn seq(value: &Value, deep: bool) {
     let mut visited = HashSet::new();
     seq_impl(value, deep, &mut visited)
+}
+
+// TODO: this catches wayyyyy too many errors
+//       add more metadata to NixException
+fn try_eval(value: &Value) -> bool {
+    catch_nix_unwind(move || {
+        seq(value, false);
+    })
+    .is_ok()
 }
 
 fn from_json(text: JsonValue) -> Value {

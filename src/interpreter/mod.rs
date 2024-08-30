@@ -1,7 +1,7 @@
-use std::{mem::ManuallyDrop, rc::Rc};
+use std::rc::Rc;
 
 use crate::{
-    compiler::{Executable, COMPILER},
+    compiler::COMPILER,
     runnable::{Runnable, RunnableVTable},
     throw, LazyValue, Parameter, Program, Scope, Value, ValueMap,
 };
@@ -82,27 +82,10 @@ fn create_function_scope(
     scope
 }
 
-union DynamicallyCompiledInner {
-    interpreted: ManuallyDrop<Interpreted>,
-    compiled: ManuallyDrop<Rc<Runnable<Executable>>>,
-}
-
 struct DynamicallyCompiled {
-    times_executed: usize,
     compilation_threshold: usize,
-    program: DynamicallyCompiledInner,
-}
-
-impl Drop for DynamicallyCompiled {
-    fn drop(&mut self) {
-        unsafe {
-            if self.times_executed >= self.compilation_threshold {
-                ManuallyDrop::drop(&mut self.program.compiled)
-            } else {
-                ManuallyDrop::drop(&mut self.program.interpreted)
-            }
-        }
-    }
+    program: Rc<Program>,
+    parameter: Option<Parameter>,
 }
 
 pub fn into_dynamically_compiled(
@@ -114,43 +97,48 @@ pub fn into_dynamically_compiled(
         unsafe {
             let this = &*Runnable::upcast::<DynamicallyCompiled>(this);
             let inner = &mut **this.inner.get();
-            if inner.times_executed >= inner.compilation_threshold {
-                // println!(
-                //     "Runnable at {:?} executed {} times, JIT compiling",
-                //     this as *const _, inner.times_executed
-                // );
-                let interpreted = ManuallyDrop::take(&mut inner.program.interpreted);
+            if inner.program.executions.get() >= inner.compilation_threshold {
+                eprintln!(
+                    "Runnable at {:?} executed {} times, JIT compiling",
+                    this as *const _,
+                    inner.program.executions.get()
+                );
                 let compiled = COMPILER
-                    .compile(&interpreted.program, interpreted.parameter.as_ref())
+                    .compile(&inner.program, inner.parameter.as_ref())
                     .unwrap();
+                *inner.program.compiled.get() = Some(compiled.clone());
                 // NOTE: One of the few reasons why this works is because Runnable<Executable>
                 //       doesn't actually care what Runnable it's in.
                 (*this.vtable.get()).run = compiled.vtable().run;
                 compiled.run(scope, arg)
             } else {
-                inner.times_executed += 1;
-                let program = &inner.program.interpreted.program;
-                let scope = if let Some(param) = &inner.program.interpreted.parameter {
+                inner
+                    .program
+                    .executions
+                    .set(inner.program.executions.get() + 1);
+                let scope = if let Some(param) = &inner.parameter {
                     create_function_scope(scope, param, arg)
                 } else {
                     scope
                 };
-                eval::interpret(scope, program, inner.compilation_threshold)
+                eval::interpret(scope, &inner.program, inner.compilation_threshold)
             }
         }
     }
 
     unsafe {
-        Runnable::new(
-            RunnableVTable::with_default_drop::<DynamicallyCompiled>(run),
-            DynamicallyCompiled {
-                times_executed: 0,
-                compilation_threshold,
-                program: DynamicallyCompiledInner {
-                    interpreted: ManuallyDrop::new(Interpreted { program, parameter }),
+        if let Some(compiled) = &*program.compiled.get() {
+            Rc::from_raw(Runnable::erase(Rc::into_raw(compiled.clone())))
+        } else {
+            Runnable::new(
+                RunnableVTable::with_default_drop::<DynamicallyCompiled>(run),
+                DynamicallyCompiled {
+                    compilation_threshold,
+                    program,
+                    parameter,
                 },
-            },
-        )
-        .into_erased_rc()
+            )
+            .into_erased_rc()
+        }
     }
 }

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, iter::Peekable, path::PathBuf, rc::Rc};
+use std::{cell::{Cell, UnsafeCell}, collections::BTreeMap, iter::Peekable, path::PathBuf, rc::Rc};
 
 use rnix::{
     ast::{
@@ -9,7 +9,7 @@ use rnix::{
 // NOTE: Importing this from rowan works but not from rnix...
 use rowan::ast::AstNode;
 
-use crate::{perfstats::measure_ir_generation_time, UnpackedValue, Value};
+use crate::{compiler::Executable, perfstats::measure_ir_generation_time, runnable::Runnable, UnpackedValue, Value};
 
 #[derive(Debug)]
 pub struct SourceFile {
@@ -35,7 +35,7 @@ pub(crate) enum Parameter {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum AttrsetValue {
     Load,
     Inherit(usize),
@@ -45,7 +45,7 @@ pub(crate) enum AttrsetValue {
 
 // FIXME: Is this truly what we want to do?
 //        Not the cleanest thing in the world.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CreateValueMap {
     pub(crate) rec: bool,
     pub(crate) parents: Vec<Rc<Program>>,
@@ -119,14 +119,16 @@ pub(crate) enum Operation {
     SourceSpanPop,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Program {
+    pub(crate) executions: Cell<usize>,
     pub(crate) operations: Vec<Operation>,
+    pub(crate) compiled: UnsafeCell<Option<Rc<Runnable<Executable>>>>
 }
 
 impl Program {
     fn new() -> Self {
-        Self { operations: vec![] }
+        Self { executions: Cell::new(0), operations: vec![], compiled: UnsafeCell::default() }
     }
 
     #[inline(always)]
@@ -372,7 +374,7 @@ impl CreateValueMap {
 
 impl IRCompiler {
     fn create_owned_program(&self, expr: Expr) -> Program {
-        let mut program = Program { operations: vec![] };
+        let mut program = Program::new();
         self.build_program(expr, &mut program);
         program
     }
@@ -521,7 +523,13 @@ impl IRCompiler {
                         UnpackedValue::Integer(x.value().unwrap() as i32).pack(),
                     ));
                 }
-                rnix::ast::LiteralKind::Uri(_) => todo!(),
+                rnix::ast::LiteralKind::Uri(x) => {
+                    program
+                        .operations
+                        .push(Operation::Push(UnpackedValue::new_string(
+                            x.syntax().text().to_string(),
+                        ).pack()))
+                }
             },
             Expr::Lambda(x) => {
                 let param = x.param().unwrap();

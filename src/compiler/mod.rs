@@ -30,7 +30,7 @@ pub enum CompiledParameter {
 }
 
 #[derive(Debug)]
-pub struct ExecutableClosure {
+struct ExecutableClosure {
     _strings: LinkedList<String>,
     _runnables: Vec<Rc<Runnable<Executable>>>,
     _values: Vec<Value>,

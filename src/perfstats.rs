@@ -94,19 +94,19 @@ def_counter_constructor!(measure_parsing_time, time_spent_parsing, 3);
 pub fn print_stats() {
     let stats = unsafe { COUNTER.clone() };
 
-    println!(
+    eprintln!(
         "total time spent evaluating = {:.2}ms",
         stats.total_time_spent_evaluating.as_secs_f64() * 1000.
     );
-    println!(
+    eprintln!(
         "time spent generating IR = {:.2}ms",
         stats.time_spent_generating_ir.as_secs_f64() * 1000.
     );
-    println!(
+    eprintln!(
         "time spent generating JIT executables = {:.2}ms",
         stats.time_spent_jitting.as_secs_f64() * 1000.
     );
-    println!(
+    eprintln!(
         "time spent parsing Nix source = {:.2}ms",
         stats.time_spent_parsing.as_secs_f64() * 1000.
     );
