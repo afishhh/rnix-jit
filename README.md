@@ -11,3 +11,6 @@ lacks:
 - skill
 
 will I finish this? great question
+
+ideas:
+- keep track which identifiers may refer to builtins and also jit builtins
