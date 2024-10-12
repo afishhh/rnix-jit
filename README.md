@@ -14,3 +14,9 @@ will I finish this? great question
 
 ideas:
 - keep track which identifiers may refer to builtins and also jit builtins
+- refactor intermediate representation:
+    - add a locals table (nix variables cannot have dynamic names)
+        - reuse locals for `parents` in map construction
+    - linearize all operations by compiling into a byte buffer
+        - store constant operands in-line
+        - add jump instruction to actually make this possible
