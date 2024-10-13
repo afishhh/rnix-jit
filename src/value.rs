@@ -262,15 +262,9 @@ impl UnpackedValue {
             }};
         }
         match self {
-            Self::Integer(x) => unsafe {
-                Value::from_raw_parts(ValueKind::Integer, std::mem::transmute::<_, u32>(x).into())
-            },
-            Self::Double(x) => {
-                let bits = x.to_bits();
-                debug_assert!(bits & NAN_BITS_MASK != SIGNALLING_NAN_BITS);
-                Value(bits)
-            }
-            Self::Bool(x) => unsafe { Value::from_raw_parts(ValueKind::Bool, x as u64) },
+            Self::Integer(x) => Value::from_i32(x),
+            Self::Double(x) => Value::from_f64(x),
+            Self::Bool(x) => Value::from_bool(x),
             Self::String(ptr) => pack_ptr!(ptr, String),
             Self::Path(ptr) => pack_ptr!(ptr, Path),
             Self::List(ptr) => pack_ptr!(ptr, List),
@@ -556,6 +550,9 @@ pub struct Value(u64);
 
 impl Value {
     pub const NULL: Value = unsafe { Value::from_raw_parts(ValueKind::Null, 0) };
+    pub const NAN: Value = unsafe { Value::from_raw(QUIET_NAN_BITS) };
+    pub const INFINTY: Value = Value::from_f64(f64::INFINITY);
+    pub const NEG_INFINTY: Value = Value::from_f64(f64::NEG_INFINITY);
     pub const TRUE: Value = unsafe { Value::from_raw_parts(ValueKind::Bool, 1) };
     pub const FALSE: Value = unsafe { Value::from_raw_parts(ValueKind::Bool, 0) };
 
@@ -586,6 +583,21 @@ impl Value {
             Value::TRUE
         } else {
             Value::FALSE
+        }
+    }
+
+    pub(crate) const fn from_f64(value: f64) -> Value {
+        let bits = value.to_bits();
+        debug_assert!(bits & NAN_BITS_MASK != SIGNALLING_NAN_BITS);
+        unsafe { Value::from_raw(bits) }
+    }
+
+    pub(crate) const fn from_i32(value: i32) -> Value {
+        unsafe {
+            Value::from_raw_parts(
+                ValueKind::Integer,
+                std::mem::transmute::<_, u32>(value) as u64,
+            )
         }
     }
 
